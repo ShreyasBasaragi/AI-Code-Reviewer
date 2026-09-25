@@ -74,3 +74,6 @@ rag/data/raw/*.zip
 
 # macOS
 .DS_Store
+
+# MCP Logs
+mcp_server/logs/

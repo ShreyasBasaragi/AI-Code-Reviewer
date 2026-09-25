@@ -11,6 +11,9 @@ Demonstrates:
   6. MCP Tool Invocation
 """
 
+import os
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
 import sys
 import time
 from rag.retrieve import retrieve_context
