@@ -1,0 +1,42 @@
+[
+  {
+    "id": "mutable_default_arg",
+    "title": "Mutable Default Parameter Anti-Pattern",
+    "category": "Bug / Memory Safety",
+    "description": "Default parameter values are evaluated once when the function is defined. If a mutable object like a list or dictionary is used as a default, mutations persist across every subsequent call to that function.",
+    "bad_example": "def append_item(val, items=[]):\n    items.append(val)\n    return items",
+    "good_example": "def append_item(val, items=None):\n    if items is None:\n        items = []\n    items.append(val)\n    return items"
+  },
+  {
+    "id": "sql_injection_string_concat",
+    "title": "SQL Injection via String Concatenation",
+    "category": "Security Vulnerability",
+    "description": "Constructing SQL queries by concatenating raw user input directly into the query string enables SQL injection attacks. An attacker can manipulate input to execute arbitrary database queries or steal data.",
+    "bad_example": "def query_user(user_id):\n    sql = \"SELECT * FROM users WHERE id = \" + user_id\n    return db.execute(sql)",
+    "good_example": "def query_user(user_id):\n    sql = \"SELECT * FROM users WHERE id = %s\"\n    return db.execute(sql, (user_id,))"
+  },
+  {
+    "id": "bare_except_swallow",
+    "title": "Bare Except Clause and Error Swallowing",
+    "category": "Reliability / Maintainability",
+    "description": "Using a bare 'except:' catches all exceptions, including KeyboardInterrupt and SystemExit, making it impossible to terminate the program properly and hiding critical runtime errors.",
+    "bad_example": "try:\n    save_data(payload)\nexcept:\n    pass",
+    "good_example": "try:\n    save_data(payload)\nexcept (DatabaseError, IOError) as err:\n    logger.error(f'Failed to save payload: {err}')\n    raise"
+  },
+  {
+    "id": "unclosed_file_descriptor",
+    "title": "Unclosed Resource and Missing Context Manager",
+    "category": "Resource Leak",
+    "description": "Opening files or network sockets without using a 'with' statement risks resource leaks if exceptions occur before close() is called.",
+    "bad_example": "def read_config(path):\n    f = open(path, 'r')\n    data = f.read()\n    f.close()\n    return data",
+    "good_example": "def read_config(path):\n    with open(path, 'r', encoding='utf-8') as f:\n        return f.read()"
+  },
+  {
+    "id": "hardcoded_api_key",
+    "title": "Hardcoded API Key / Secret Token",
+    "category": "Security Vulnerability",
+    "description": "Hardcoding secrets, API tokens, or passwords into source code exposes credentials to version control and potential unauthorized access.",
+    "bad_example": "API_KEY = 'sk-proj-998877665544332211'\nclient = APIClient(api_key=API_KEY)",
+    "good_example": "import os\nAPI_KEY = os.getenv('SERVICE_API_KEY')\nif not API_KEY:\n    raise ValueError('SERVICE_API_KEY environment variable is required')\nclient = APIClient(api_key=API_KEY)"
+  }
+]

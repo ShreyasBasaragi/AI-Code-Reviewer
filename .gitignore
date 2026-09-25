@@ -41,6 +41,13 @@ rag/data/chroma_db/
 .cache/
 huggingface/
 *.sqlite3
+models/
+llm/model/
+llm/weights/
+*.safetensors
+*.bin
+*.pt
+*.gguf
 
 # Test & Coverage
 .pytest_cache/
@@ -61,8 +68,9 @@ venv/
 
 # Local RAG / vector database
 rag/data/chroma_db/
-rag/data/raw/
 rag/data/processed/
+rag/data/raw/microsoft_codereviewer/
+rag/data/raw/*.zip
 
 # macOS
 .DS_Store
