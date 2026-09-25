@@ -1,0 +1,117 @@
+{
+  "metrics": {
+    "accuracy": 44.44,
+    "precision": 57.14,
+    "recall": 66.67,
+    "f1_score": 0.615,
+    "category_match_rate": 50.0,
+    "avg_latency_seconds": 17.9,
+    "confusion_matrix": {
+      "tp": 4,
+      "tn": 0,
+      "fp": 3,
+      "fn": 2
+    }
+  },
+  "cases": [
+    {
+      "id": "SEC-01",
+      "name": "SQL Injection via Concatenation",
+      "ground_truth": true,
+      "predicted": true,
+      "status": "TP [Hit]",
+      "pred_type": "Security",
+      "pred_severity": "High",
+      "latency": 20.35742712020874,
+      "review": "### Review Comment\n\n#### Issue Found: Yes\n#### Issue Type: Security\n#### Severity: High\n#### Explanation: The code concatenates user input directly into a SQL query, which can lead to SQL injection at"
+    },
+    {
+      "id": "BUG-01",
+      "name": "Mutable Default Argument",
+      "ground_truth": true,
+      "predicted": true,
+      "status": "TP [Hit]",
+      "pred_type": "Code Quality / Style / None",
+      "pred_severity": "Medium",
+      "latency": 30.95948100090027,
+      "review": "### Review Comment\n\n#### Issue Found: Yes\n#### Issue Type: Code Quality / Style / None\n#### Severity: Medium\n#### Explanation: Using mutable default parameters can lead to unexpected behavior due to s"
+    },
+    {
+      "id": "RES-01",
+      "name": "Unclosed File Descriptor Leak",
+      "ground_truth": true,
+      "predicted": false,
+      "status": "FN [Miss]",
+      "pred_type": "Style",
+      "pred_severity": "Medium",
+      "latency": 16.908135890960693,
+      "review": "### Review Comment\n\n#### Issue Type: Style\n\n#### Severity: Medium\n\n#### Explanation:\nThe `load_credentials` function opens a file directly without using a context manager (`with open(...) as ...`). Th"
+    },
+    {
+      "id": "SEC-02",
+      "name": "Hardcoded API Secret Key",
+      "ground_truth": true,
+      "predicted": true,
+      "status": "TP [Hit]",
+      "pred_type": "Security",
+      "pred_severity": "Medium",
+      "latency": 9.258225440979004,
+      "review": "Issue Found: Yes\nIssue Type: Security\nSeverity: Medium\nExplanation: The API key is being hard-coded in the code, which could lead to security issues if the code is exposed or shared.\nEvidence: `API_SE"
+    },
+    {
+      "id": "BUG-02",
+      "name": "Bare Except Swallowing Errors",
+      "ground_truth": true,
+      "predicted": true,
+      "status": "TP [Hit]",
+      "pred_type": "Security",
+      "pred_severity": "Medium",
+      "latency": 15.986838340759277,
+      "review": "### Review Comment\n\n#### Issue Found: Yes\n#### Issue Type: Security\n#### Severity: Medium\n#### Explanation: The function `save_user_profile` uses a bare `except` clause, which can catch exceptions lik"
+    },
+    {
+      "id": "LOG-01",
+      "name": "Off-by-One Pagination Indexing",
+      "ground_truth": true,
+      "predicted": false,
+      "status": "FN [Miss]",
+      "pred_type": "None",
+      "pred_severity": "None",
+      "latency": 26.13935089111328,
+      "review": "### Review Comment\n\n#### Code Pattern: Mutable Default Parameter Anti-Pattern\n\n**Description**: Default parameter values are evaluated once when the function is defined. If a mutable object like a lis"
+    },
+    {
+      "id": "CLEAN-01",
+      "name": "Safe Parameterized SQL Query",
+      "ground_truth": false,
+      "predicted": true,
+      "status": "FP [Overflag]",
+      "pred_type": "Security",
+      "pred_severity": "High",
+      "latency": 11.81666088104248,
+      "review": "### Review Comment\n\n#### Issue Found: Yes\n#### Issue Type: Security\n#### Severity: High\n#### Explanation: The function `get_user_records_safe` uses a raw SQL query with user input concatenated directl"
+    },
+    {
+      "id": "CLEAN-02",
+      "name": "Clean Math Utility with Validation",
+      "ground_truth": false,
+      "predicted": true,
+      "status": "FP [Overflag]",
+      "pred_type": "Style / Readability",
+      "pred_severity": "Medium",
+      "latency": 10.2910897731781,
+      "review": "### Review Comment\n\n#### Issue Found: Yes\n#### Issue Type: Style / Readability\n#### Severity: Medium\n#### Explanation: The function name `calculate_circle_area` does not follow the naming convention o"
+    },
+    {
+      "id": "CLEAN-03",
+      "name": "Safe Context Manager File Handling",
+      "ground_truth": false,
+      "predicted": true,
+      "status": "FP [Overflag]",
+      "pred_type": "Style / Readability",
+      "pred_severity": "Medium",
+      "latency": 19.39622211456299,
+      "review": "### Review Comment\n\n#### Issue Found: Yes\n\n#### Issue Type: Style / Readability\n\n#### Severity: Medium\n\n#### Explanation:\nThe `load_config_safe` function opens a file and reads its contents directly, "
+    }
+  ]
+}
