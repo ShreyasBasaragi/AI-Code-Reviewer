@@ -139,7 +139,8 @@ def load_owasp_records(limit: int = 250) -> list[CanonicalRecord]:
                     type="security_pattern",
                     tags=["security", "owasp", "secure_coding"],
                     metadata={
-                        "origin": "OWASP Cheat Sheet Series",\n                        "cheatsheet": path.stem,
+                        "origin": "OWASP Cheat Sheet Series",
+                        "cheatsheet": path.stem,
                         "section": title,
                         "source_url": "https://cheatsheetseries.owasp.org/",
                         "license": "CC BY-SA 4.0",
