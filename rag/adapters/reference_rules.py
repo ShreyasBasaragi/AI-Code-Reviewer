@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import logging
 import re
 import zipfile
@@ -124,13 +125,14 @@ def load_owasp_records(limit: int = 250) -> list[CanonicalRecord]:
     for path in markdown_files:
         if any(part.startswith(".") for part in path.relative_to(OWASP_DIR).parts):
             continue
+        path_key = hashlib.sha1(str(path.relative_to(OWASP_DIR)).encode("utf-8")).hexdigest()[:10]
         for section_index, (title, body) in enumerate(_markdown_sections(path)):
             text = f"OWASP security guidance: {path.stem} — {title}\n{body}"
             if len(text) < 80:
                 continue
             records.append(
                 CanonicalRecord(
-                    id=f"owasp_{path.stem}_{section_index}",
+                    id=f"owasp_{path_key}_{section_index}",
                     text=text,
                     source="owasp_cwe",
                     language="language_agnostic",
