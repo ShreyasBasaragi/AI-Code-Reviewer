@@ -29,7 +29,7 @@ def _xml_text(element) -> str:
     return sanitize_text(" ".join(part.strip() for part in element.itertext() if part.strip()))
 
 
-def load_cwe_records(limit: int = 800) -> list[CanonicalRecord]:
+def load_cwe_records(limit: int = 700) -> list[CanonicalRecord]:
     """Read weakness definitions from the official MITRE CWE XML archive."""
     if not CWE_ZIP.exists():
         logger.warning("CWE archive missing. Run scripts/fetch_reference_sources.py.")
@@ -132,12 +132,12 @@ def load_owasp_records(limit: int = 250) -> list[CanonicalRecord]:
                 CanonicalRecord(
                     id=f"owasp_{path.stem}_{section_index}",
                     text=text,
-                    source="owasp_cheatsheet",
+                    source="owasp_cwe",
                     language="language_agnostic",
                     type="security_pattern",
                     tags=["security", "owasp", "secure_coding"],
                     metadata={
-                        "cheatsheet": path.stem,
+                        "origin": "OWASP Cheat Sheet Series",\n                        "cheatsheet": path.stem,
                         "section": title,
                         "source_url": "https://cheatsheetseries.owasp.org/",
                         "license": "CC BY-SA 4.0",
