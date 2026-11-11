@@ -79,3 +79,9 @@ rag/data/raw/*.zip
 # MCP Logs
 mcp_server/logs/
 rag/data/chroma_db_v2/
+
+rag/data/raw/owasp_cheatsheets/
+rag/data/raw/bandit_rules/
+rag/data/raw/cwe/
+rag/data/raw/pep-0008.html
+rag/data/raw/google_pyguide.md
