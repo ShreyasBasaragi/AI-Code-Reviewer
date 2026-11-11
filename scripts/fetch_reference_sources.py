@@ -19,7 +19,7 @@ RAW = ROOT / "rag" / "data" / "raw"
 DOWNLOADS = {
     "cwe": "https://cwe.mitre.org/data/xml/cwec_latest.xml.zip",
     "owasp": "https://github.com/OWASP/CheatSheetSeries/archive/refs/heads/master.zip",
-    "bandit": "https://github.com/PyCQA/bandit/archive/refs/heads/master.zip",
+    "bandit": "https://github.com/PyCQA/bandit/archive/refs/heads/main.zip",
     "pep8": "https://peps.python.org/pep-0008/",
     "google_style": "https://raw.githubusercontent.com/google/styleguide/gh-pages/pyguide.md",
 }
