@@ -1,5 +1,10 @@
+"""Read-only retrieval for the versioned RAG corpus.
+
+Retrieval never creates a ChromaDB collection or triggers ingestion. Build the
+collection explicitly with the ingestion command before calling this module.
+"""
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 import chromadb
 from chromadb.utils import embedding_functions
@@ -15,104 +20,68 @@ logger = logging.getLogger(__name__)
 
 _chroma_client: Optional[chromadb.PersistentClient] = None
 _collection = None
+_embedding_function = None
 
 
 def _get_collection():
-    """Lazy initialize and return ChromaDB collection instance."""
-    global _chroma_client, _collection
+    """Return the existing v2 collection; never create it during retrieval."""
+    global _chroma_client, _collection, _embedding_function
 
-    if _collection is None:
-        try:
-            _chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
-            embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
+    if _collection is not None:
+        return _collection
+
+    try:
+        _chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+        _embedding_function = (
+            embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name=EMBEDDING_MODEL_NAME
             )
-            _collection = _chroma_client.get_or_create_collection(
-                name=COLLECTION_NAME,
-                embedding_function=embedding_fn,
-                metadata={"hnsw:space": "cosine"}
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize ChromaDB collection: {e}")
-            return None
+        )
+        # get_collection is intentional: a missing index is an actionable setup
+        # error, not a reason for a read operation to mutate local storage.
+        _collection = _chroma_client.get_collection(
+            name=COLLECTION_NAME,
+            embedding_function=_embedding_function,
+        )
+        return _collection
+    except Exception as exc:
+        logger.warning(
+            "RAG collection '%s' is unavailable. Run the explicit ingestion "
+            "command first. Details: %s",
+            COLLECTION_NAME,
+            exc,
+        )
+        return None
 
-    return _collection
 
+def retrieve_context(code: str) -> list[str]:
+    """Return the four most relevant context chunks for a code snippet.
 
-def retrieve_context_for_repository(
-    code: str,
-    repository: Optional[str] = None,
-    k: int = DEFAULT_K
-) -> List[str]:
+    This is the stable integration interface. It performs read-only retrieval
+    and has no ingestion, collection-creation, or filesystem side effects.
     """
-    Retrieve top-k relevant context strings for a given target code snippet,
-    with optional repository-specific metadata filtering.
-
-    Args:
-        code: Input source code snippet or PR diff string.
-        repository: Optional target repository string (e.g. 'psf/requests').
-        k: Number of relevant context snippets to retrieve.
-
-    Returns:
-        List of context text strings matching the query snippet.
-    """
-    if not code or not code.strip():
-        logger.warning("Empty code string passed to retrieval function.")
+    if not isinstance(code, str) or not code.strip():
         return []
 
     collection = _get_collection()
     if collection is None:
-        logger.error("ChromaDB collection unavailable.")
         return []
-
-    # Limit code query string length to avoid token limits
-    query_text = code.strip()[:2000]
 
     try:
         count = collection.count()
         if count == 0:
-            logger.warning("ChromaDB collection is empty. Run ingestion first.")
+            logger.warning("RAG collection '%s' is empty.", COLLECTION_NAME)
             return []
 
-        actual_k = min(k, count)
-        where_filter = None
-        if repository:
-            where_filter = {"repository": str(repository)}
-
-        query_params: Dict[str, Any] = {
-            "query_texts": [query_text],
-            "n_results": actual_k
-        }
-        if where_filter:
-            query_params["where"] = where_filter
-
-        try:
-            results = collection.query(**query_params)
-        except Exception as filter_err:
-            logger.warning(f"Repository filter failed or returned no hits: {filter_err}. Falling back to global search.")
-            results = collection.query(query_texts=[query_text], n_results=actual_k)
-
-        documents = results.get("documents", [[]])[0]
-        return documents if documents else []
-
-    except Exception as e:
-        logger.error(f"Error querying ChromaDB context: {e}")
+        # Keep the query bounded. The embedding model also applies its own
+        # tokenizer truncation; corpus chunks are bounded during ingestion.
+        query_text = code.strip()[:6000]
+        results = collection.query(
+            query_texts=[query_text],
+            n_results=min(DEFAULT_K, count),
+        )
+        documents = results.get("documents") or [[]]
+        return [doc for doc in documents[0] if isinstance(doc, str)]
+    except Exception:
+        logger.exception("Context retrieval failed.")
         return []
-
-
-def retrieve_context(code: str, k: int = DEFAULT_K) -> List[str]:
-    """
-    Retrieve top-k relevant context strings (style rules, patterns, past reviews)
-    given a target code snippet or PR diff.
-
-    FROZEN INTERFACE CONTRACT:
-    Signature MUST remain `retrieve_context(code: str, k: int = 5) -> list[str]`.
-
-    Args:
-        code: Input source code snippet or PR diff string.
-        k: Number of relevant context snippets to retrieve.
-
-    Returns:
-        A list of context text strings matching the query snippet.
-    """
-    return retrieve_context_for_repository(code=code, repository=None, k=k)
