@@ -67,6 +67,7 @@ __pycache__/
 venv/
 
 # Local RAG / vector database
+rag/data/evaluation/
 rag/data/chroma_db/
 rag/data/processed/
 rag/data/raw/microsoft_codereviewer/
