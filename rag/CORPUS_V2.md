@@ -15,7 +15,7 @@ are ignored by Git.
 
 The implementation caps the security adapter at 700 CWE weaknesses plus 250
 OWASP sections and the style adapter at 400 extracted records. All records are
-token-chunked with the all-MiniLM-L6-v2 tokenizer at 220 tokens with 24-token
+token-chunked with the all-MiniLM-L6-v2 tokenizer at 200 tokens with 20-token
 overlap, below the model's 256-token input limit.
 
 The Hugging Face `ronantakizawa/github-codereview` dataset is not an ingestion
@@ -81,7 +81,7 @@ from rag.retrieve import retrieve_context
 contexts: list[str] = retrieve_context(code)
 ```
 
-It returns up to four context strings, most relevant first. Retrieval does not
+It returns up to three context strings, most relevant first. Retrieval does not
 create a collection, ingest data, or invoke the demo.
 
 ## Validation caveats
