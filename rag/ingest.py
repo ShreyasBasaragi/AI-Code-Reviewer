@@ -176,7 +176,7 @@ def ingest_to_chromadb(records: list[CanonicalRecord]) -> int:
     return collection.count()
 
 
-def run_ingestion(max_ms_per_category: int = 3000) -> dict[str, Any]:
+def run_ingestion(max_ms_per_category: int = 8000) -> dict[str, Any]:
     """Build the v2 corpus from Microsoft training data and official rule sources."""
     RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -250,7 +250,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-ms-per-category",
         type=int,
-        default=3000,
+        default=8000,
         help="Maximum training records per Microsoft dataset category.",
     )
     args = parser.parse_args()
