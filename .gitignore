@@ -77,4 +77,5 @@ rag/data/raw/*.zip
 .DS_Store
 
 # MCP Logs
-mcp_server/logs/
+mcp_server/logs/
+rag/data/chroma_db_v2/
