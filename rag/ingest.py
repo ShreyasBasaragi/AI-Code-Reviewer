@@ -36,8 +36,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 TOKENIZER_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-MAX_CHUNK_TOKENS = 220
-CHUNK_OVERLAP_TOKENS = 24
+MAX_CHUNK_TOKENS = 200
+CHUNK_OVERLAP_TOKENS = 20
 BATCH_SIZE = 256
 MAX_TOTAL_CHUNKS = 12_000
 MAX_MICROSOFT_CHUNKS = 10_000
