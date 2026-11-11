@@ -209,23 +209,30 @@ def _style_records_from_blocks(blocks, source: str, prefix: str, limit: int):
 def load_style_records(limit: int = 400) -> list[CanonicalRecord]:
     """Load PEP 8, Google Python Style Guide, and Bandit rule descriptions."""
     records = []
+    guide_quota = max(1, limit // 4)
 
     if PEP8_HTML.exists():
         parser = _TextBlocks()
         parser.feed(PEP8_HTML.read_text(encoding="utf-8", errors="ignore"))
         records.extend(
-            _style_records_from_blocks(parser.blocks, "PEP 8", "pep8", limit)
-        )
-
-    if len(records) < limit and GOOGLE_STYLE_MD.exists():
-        blocks = [("p", body) for _, body in _markdown_sections(GOOGLE_STYLE_MD)]
-        records.extend(
             _style_records_from_blocks(
-                blocks, "Google Python Style Guide", "google_style", limit - len(records)
+                parser.blocks, "PEP 8", "pep8", guide_quota
             )
         )
 
-    if len(records) < limit and BANDIT_DIR.exists():
+    if GOOGLE_STYLE_MD.exists():
+        blocks = [
+            ("p", f"{title}\n{body}")
+            for title, body in _markdown_sections(GOOGLE_STYLE_MD)
+        ]
+        records.extend(
+            _style_records_from_blocks(
+                blocks, "Google Python Style Guide", "google_style", guide_quota
+            )
+        )
+
+    if BANDIT_DIR.exists():
+        bandit_records = []
         plugin_files = sorted(BANDIT_DIR.rglob("*.py"))
         for path in plugin_files:
             try:
@@ -238,7 +245,7 @@ def load_style_records(limit: int = 400) -> list[CanonicalRecord]:
                 doc = ast.get_docstring(node)
                 if not doc or len(doc.strip()) < 45:
                     continue
-                records.append(
+                bandit_records.append(
                     CanonicalRecord(
                         id=f"bandit_{path.stem}_{node.name}",
                         text=f"Bandit static-analysis rule {node.name}\n{doc.strip()}",
@@ -253,8 +260,7 @@ def load_style_records(limit: int = 400) -> list[CanonicalRecord]:
                         },
                     )
                 )
-                if len(records) >= limit:
-                    return records
+        records.extend(bandit_records[: max(0, limit - len(records))])
 
     # Stable de-duplication across guides that may repeat the same advice.
     unique = []
@@ -268,7 +274,6 @@ def load_style_records(limit: int = 400) -> list[CanonicalRecord]:
         if len(unique) >= limit:
             break
     return unique
-
 
 def load_reference_rule_records() -> list[CanonicalRecord]:
     """Load the configured security and style/static-analysis source records."""
