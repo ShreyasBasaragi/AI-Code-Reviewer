@@ -1,226 +1,257 @@
-import json
+"""Explicit corpus builder for the versioned RAG index.
+
+Run after downloading official reference sources:
+    python scripts/fetch_reference_sources.py
+    python -m rag.ingest
+
+The Hugging Face github-codereview dataset is deliberately NOT an ingestion
+source. Its test split is reserved for the independent evaluation holdout.
+"""
+from __future__ import annotations
+
+import argparse
 import hashlib
+import json
 import logging
+from collections import Counter
 from pathlib import Path
-from typing import List, Dict, Any, Tuple
+from typing import Any
 
 import chromadb
 from chromadb.utils import embedding_functions
+from transformers import AutoTokenizer
 
 from rag.adapters.base import CanonicalRecord, sanitize_text, validate_canonical_record
-from rag.adapters.github_codereview import load_github_codereview
 from rag.adapters.microsoft_codereviewer import load_microsoft_codereviewer
+from rag.adapters.reference_rules import load_reference_rule_records
 from rag.config import (
-    RAW_DATA_DIR,
-    PROCESSED_DATA_DIR,
     CHROMA_PERSIST_DIR,
     COLLECTION_NAME,
     EMBEDDING_MODEL_NAME,
+    PROCESSED_DATA_DIR,
+    RAW_DATA_DIR,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+TOKENIZER_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MAX_CHUNK_TOKENS = 220
+CHUNK_OVERLAP_TOKENS = 24
+BATCH_SIZE = 256
+MAX_TOTAL_CHUNKS = 12_000
+TARGET_MIN_CHUNKS = 6_000
+MAX_DB_BYTES = 50 * 1024 * 1024
 
-def load_raw_baseline_chunks() -> List[CanonicalRecord]:
-    """Load baseline style guide & anti-pattern chunks from raw data directory."""
-    baseline_records: List[CanonicalRecord] = []
 
-    # Style Guide
-    style_file = RAW_DATA_DIR / "style_guide.md"
-    if style_file.exists():
-        content = style_file.read_text(encoding="utf-8")
-        sections = content.split("## ")
-        for idx, sec in enumerate(sections):
-            sec = sec.strip()
-            if not sec or sec.startswith("# "):
-                continue
-            lines = sec.split("\n", 1)
-            header = lines[0].strip()
-            body = lines[1].strip() if len(lines) > 1 else ""
-            baseline_records.append(CanonicalRecord(
-                id=f"style_guide_{idx}",
-                text=f"Python Style Rule: {header}\n{body}",
-                source="style_guide",
-                language="python",
-                type="convention",
-                tags=["python", "style_guide"],
-                metadata={"category": header}
-            ))
+def _load_tokenizer():
+    logger.info("Loading tokenizer: %s", TOKENIZER_MODEL_NAME)
+    return AutoTokenizer.from_pretrained(TOKENIZER_MODEL_NAME)
 
-    # Common Patterns
-    pattern_file = RAW_DATA_DIR / "common_patterns.json"
-    if pattern_file.exists():
-        with open(pattern_file, "r", encoding="utf-8") as f:
-            patterns = json.load(f)
-        for item in patterns:
-            text = (
-                f"Code Pattern: {item.get('title')}\n"
-                f"Description: {item.get('description')}\n"
-                f"Bad Example:\n{item.get('bad_example')}\n"
-                f"Good Example:\n{item.get('good_example')}"
+
+def chunk_record(
+    record: CanonicalRecord,
+    tokenizer,
+    max_tokens: int = MAX_CHUNK_TOKENS,
+    overlap: int = CHUNK_OVERLAP_TOKENS,
+) -> list[CanonicalRecord]:
+    """Split a source record into deterministic, model-token-bounded chunks."""
+    text = sanitize_text(record.text)
+    token_ids = tokenizer.encode(text, add_special_tokens=False)
+    if not token_ids:
+        return []
+
+    chunks = []
+    start = 0
+    chunk_index = 0
+    while start < len(token_ids):
+        end = min(start + max_tokens, len(token_ids))
+        piece = tokenizer.decode(
+            token_ids[start:end],
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        ).strip()
+        if piece:
+            chunks.append(
+                CanonicalRecord(
+                    id=f"{record.id}_chunk_{chunk_index}",
+                    text=piece,
+                    source=record.source,
+                    language=record.language,
+                    type=record.type,
+                    tags=list(record.tags),
+                    metadata={
+                        **record.metadata,
+                        "parent_id": record.id,
+                        "chunk_index": str(chunk_index),
+                        "chunk_tokens": str(end - start),
+                    },
+                )
             )
-            baseline_records.append(CanonicalRecord(
-                id=f"pattern_{item.get('id')}",
-                text=text,
-                source="common_patterns",
-                language="python",
-                type="pattern",
-                tags=["python", "anti_pattern"],
-                metadata={"category": item.get("category")}
-            ))
+            chunk_index += 1
 
-    return baseline_records
+        if end >= len(token_ids):
+            break
+        start = end - overlap
+
+    return chunks
 
 
-def deduplicate_and_filter_records(
-    raw_records: List[CanonicalRecord]
-) -> Tuple[List[CanonicalRecord], Dict[str, Any]]:
-    """
-    Data Quality Pipeline:
-    - Normalizes text & validates schema
-    - Removes empty or malformed records
-    - Deduplicates identical content using MD5 content hash
-    - Tracks complete ingestion & filter metrics
-    """
-    seen_hashes = set()
-    accepted: List[CanonicalRecord] = []
+def prepare_records(records: list[CanonicalRecord], tokenizer):
+    """Validate, chunk, and deduplicate records by normalized content."""
+    chunks = []
+    seen = set()
+    rejected = 0
+    duplicates = 0
 
-    stats = {
-        "records_loaded": len(raw_records),
-        "records_accepted": 0,
-        "records_rejected": 0,
-        "records_deduplicated": 0,
-        "by_source": {},
-        "by_language": {},
-        "by_type": {}
+    for record in records:
+        record.text = sanitize_text(record.text)
+        if not validate_canonical_record(record):
+            rejected += 1
+            continue
+
+        for chunk in chunk_record(record, tokenizer):
+            normalized = " ".join(chunk.text.split()).casefold()
+            digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+            if digest in seen:
+                duplicates += 1
+                continue
+            seen.add(digest)
+            chunks.append(chunk)
+
+    return chunks, {"rejected": rejected, "deduplicated": duplicates}
+
+
+def _metadata(record: CanonicalRecord) -> dict[str, str]:
+    values = {
+        "source": record.source,
+        "language": record.language,
+        "type": record.type,
+        "tags": ",".join(record.tags),
     }
-
-    for rec in raw_records:
-        rec.text = sanitize_text(rec.text)
-
-        # Validation check
-        if not validate_canonical_record(rec):
-            stats["records_rejected"] += 1
-            continue
-
-        # Content hash for deduplication
-        content_hash = hashlib.md5(rec.text.encode("utf-8")).hexdigest()
-        if content_hash in seen_hashes:
-            stats["records_deduplicated"] += 1
-            continue
-
-        seen_hashes.add(content_hash)
-        accepted.append(rec)
-
-        # Update breakdown stats
-        stats["by_source"][rec.source] = stats["by_source"].get(rec.source, 0) + 1
-        stats["by_language"][rec.language] = stats["by_language"].get(rec.language, 0) + 1
-        stats["by_type"][rec.type] = stats["by_type"].get(rec.type, 0) + 1
-
-    stats["records_accepted"] = len(accepted)
-    return accepted, stats
+    values.update(
+        {
+            str(key): str(value)
+            for key, value in record.metadata.items()
+            if value is not None and isinstance(value, (str, int, float, bool))
+        }
+    )
+    return values
 
 
-def log_statistics(stats: Dict[str, Any]) -> None:
-    """Print readable preprocessing & quality statistics log."""
-    print("\n" + "=" * 60)
-    print("        RAG DATA INGESTION & QUALITY STATISTICS")
-    print("=" * 60)
-    print(f" Total Records Loaded:       {stats['records_loaded']}")
-    print(f" Records Accepted:           {stats['records_accepted']}")
-    print(f" Records Rejected (Malformed): {stats['records_rejected']}")
-    print(f" Records Deduplicated:       {stats['records_deduplicated']}")
-    print("-" * 60)
-    print(" Breakdown by Data Source:")
-    for src, count in stats['by_source'].items():
-        print(f"   - {src}: {count}")
-    print("-" * 60)
-    print(" Breakdown by Programming Language:")
-    for lang, count in stats['by_language'].items():
-        print(f"   - {lang}: {count}")
-    print("-" * 60)
-    print(" Breakdown by Review/Document Type:")
-    for rtype, count in stats['by_type'].items():
-        print(f"   - {rtype}: {count}")
-    print("=" * 60 + "\n")
+def _directory_size(path: Path) -> int:
+    return sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
 
 
-def ingest_to_chromadb(records: List[CanonicalRecord]) -> None:
-    """Ingest canonical records idempotently into ChromaDB vector store."""
+def ingest_to_chromadb(records: list[CanonicalRecord]) -> int:
+    """Rebuild only the v2 collection; leave the legacy collection untouched."""
     if not records:
-        logger.warning("No records available to ingest into ChromaDB.")
-        return
+        raise RuntimeError("No valid corpus chunks were produced; refusing to create an empty index.")
 
-    logger.info(f"Connecting to ChromaDB at: {CHROMA_PERSIST_DIR}")
+    CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
+    existing = {item.name for item in client.list_collections()}
+    if COLLECTION_NAME in existing:
+        logger.warning("Replacing versioned collection '%s'.", COLLECTION_NAME)
+        client.delete_collection(name=COLLECTION_NAME)
 
     embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL_NAME
     )
-
-    collection = client.get_or_create_collection(
+    collection = client.create_collection(
         name=COLLECTION_NAME,
         embedding_function=embedding_fn,
-        metadata={"hnsw:space": "cosine"}
+        metadata={"hnsw:space": "cosine", "corpus_version": "2"},
     )
 
-    ids = [r.id for r in records]
-    documents = [r.text for r in records]
-    metadatas = [
-        {
-            "source": r.source,
-            "language": r.language,
-            "type": r.type,
-            "tags": ",".join(r.tags),
-            **{k: str(v) for k, v in r.metadata.items() if v is not None}
-        }
-        for r in records
-    ]
+    for offset in range(0, len(records), BATCH_SIZE):
+        batch = records[offset : offset + BATCH_SIZE]
+        collection.add(
+            ids=[record.id for record in batch],
+            documents=[record.text for record in batch],
+            metadatas=[_metadata(record) for record in batch],
+        )
+        logger.info("Indexed %s/%s chunks", min(offset + len(batch), len(records)), len(records))
 
-    # Perform idempotent batch upserts
-    batch_size = 500
-    for i in range(0, len(records), batch_size):
-        end_idx = i + batch_size
-        collection.upsert(
-            ids=ids[i:end_idx],
-            documents=documents[i:end_idx],
-            metadatas=metadatas[i:end_idx]
+    return collection.count()
+
+
+def run_ingestion(max_ms_per_category: int = 3000) -> dict[str, Any]:
+    """Build the v2 corpus from Microsoft training data and official rule sources."""
+    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
+
+    logger.info("Loading Microsoft CodeReviewer training records...")
+    microsoft_records = load_microsoft_codereviewer(
+        max_per_category=max_ms_per_category
+    )
+    logger.info("Loaded %s Microsoft source records.", len(microsoft_records))
+
+    logger.info("Loading OWASP/CWE and style/static-analysis records...")
+    reference_records = load_reference_rule_records()
+    logger.info("Loaded %s reference-rule records.", len(reference_records))
+
+    source_records = microsoft_records + reference_records
+    tokenizer = _load_tokenizer()
+    chunks, quality = prepare_records(source_records, tokenizer)
+
+    # Bound the total corpus without changing the security/style quotas.
+    if len(chunks) > MAX_TOTAL_CHUNKS:
+        microsoft_chunks = [item for item in chunks if item.source == "microsoft_codereviewer"]
+        rule_chunks = [item for item in chunks if item.source != "microsoft_codereviewer"]
+        room_for_ms = max(0, MAX_TOTAL_CHUNKS - len(rule_chunks))
+        chunks = rule_chunks + microsoft_chunks[:room_for_ms]
+
+    source_counts = dict(Counter(item.source for item in chunks))
+    total = len(chunks)
+    logger.info("Prepared %s chunks: %s", total, source_counts)
+
+    if total < TARGET_MIN_CHUNKS:
+        logger.warning(
+            "Corpus currently has %s chunks; teammate target is %s–%s. "
+            "Check Microsoft source archive coverage and rule-source extraction.",
+            total,
+            TARGET_MIN_CHUNKS,
+            MAX_TOTAL_CHUNKS,
         )
 
-    logger.info(f"Successfully upserted {len(records)} records into ChromaDB collection '{COLLECTION_NAME}'.")
+    processed_path = PROCESSED_DATA_DIR / "canonical_chunks.jsonl"
+    with processed_path.open("w", encoding="utf-8") as output:
+        for item in chunks:
+            output.write(json.dumps(item.to_dict(), ensure_ascii=False) + "\n")
 
+    indexed = ingest_to_chromadb(chunks)
+    db_size = _directory_size(CHROMA_PERSIST_DIR)
 
-def run_ingestion(
-    max_github_records: int = 1000,
-    max_ms_per_category: int = 500
-) -> Dict[str, Any]:
-    """Run full RAG ingestion pipeline across all dataset adapters."""
-    logger.info("Starting Multi-Dataset RAG Ingestion Pipeline...")
+    report = {
+        "source_records": len(source_records),
+        "chunks_indexed": indexed,
+        "chunks_by_source": source_counts,
+        "rejected_records": quality["rejected"],
+        "deduplicated_chunks": quality["deduplicated"],
+        "database_bytes": db_size,
+        "database_mb": round(db_size / (1024 * 1024), 2),
+        "database_under_50mb": db_size < MAX_DB_BYTES,
+        "target_chunk_range_met": TARGET_MIN_CHUNKS <= indexed <= MAX_TOTAL_CHUNKS,
+    }
+    report_path = PROCESSED_DATA_DIR / "ingestion_report.json"
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    # Load from adapters
-    github_records = load_github_codereview(split="train", max_records=max_github_records)
-    ms_records = load_microsoft_codereviewer(max_per_category=max_ms_per_category)
-    baseline_records = load_raw_baseline_chunks()
-
-    all_raw_records = github_records + ms_records + baseline_records
-
-    # Data Quality Preprocessing & Statistics
-    accepted_records, stats = deduplicate_and_filter_records(all_raw_records)
-    log_statistics(stats)
-
-    # Save intermediate processed canonical chunks
-    processed_json_path = PROCESSED_DATA_DIR / "canonical_chunks.json"
-    with open(processed_json_path, "w", encoding="utf-8") as f:
-        json.dump([r.to_dict() for r in accepted_records], f, indent=2)
-    logger.info(f"Saved canonical records to: {processed_json_path}")
-
-    # Upsert to ChromaDB
-    ingest_to_chromadb(accepted_records)
-    logger.info("RAG Ingestion Pipeline finished successfully!")
-
-    return stats
+    print("\nRAG v2 ingestion report")
+    print(json.dumps(report, indent=2))
+    if db_size >= MAX_DB_BYTES:
+        logger.warning("ChromaDB directory exceeds the 50 MB target.")
+    return report
 
 
 if __name__ == "__main__":
-    run_ingestion()
+    parser = argparse.ArgumentParser(description="Build the Critique RAG v2 index.")
+    parser.add_argument(
+        "--max-ms-per-category",
+        type=int,
+        default=3000,
+        help="Maximum training records per Microsoft dataset category.",
+    )
+    args = parser.parse_args()
+    run_ingestion(max_ms_per_category=args.max_ms_per_category)
