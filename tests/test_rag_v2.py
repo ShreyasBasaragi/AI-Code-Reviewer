@@ -15,7 +15,7 @@ class FakeCollection:
 
     def query(self, **kwargs):
         self.query_args = kwargs
-        return {"documents": [["context one", "context two", "context three"]]}
+        return {"documents": [["context one", "context two", "context three", "context four"]]}
 
 
 class FakeTokenizer:
@@ -35,13 +35,13 @@ def test_empty_code_does_not_open_vector_store():
         assert retrieve_context("  ") == []
 
 
-def test_retrieval_requests_three_contexts():
+def test_retrieval_requests_four_contexts():
     collection = FakeCollection()
     with patch("rag.retrieve._get_collection", return_value=collection):
         result = retrieve_context("def calculate_total(items): return sum(items)")
 
-    assert result == ["context one", "context two", "context three"]
-    assert collection.query_args["n_results"] == 3
+    assert result == ["context one", "context two", "context three", "context four"]
+    assert collection.query_args["n_results"] == 4
 
 
 def test_chunking_respects_token_limit_and_overlap():
