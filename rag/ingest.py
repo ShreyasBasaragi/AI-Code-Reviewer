@@ -40,6 +40,7 @@ MAX_CHUNK_TOKENS = 220
 CHUNK_OVERLAP_TOKENS = 24
 BATCH_SIZE = 256
 MAX_TOTAL_CHUNKS = 12_000
+MAX_MICROSOFT_CHUNKS = 10_000
 TARGET_MIN_CHUNKS = 6_000
 MAX_DB_BYTES = 50 * 1024 * 1024
 
@@ -150,7 +151,7 @@ def ingest_to_chromadb(records: list[CanonicalRecord]) -> int:
 
     CHROMA_PERSIST_DIR.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
-    existing = {item.name for item in client.list_collections()}
+    existing = {item if isinstance(item, str) else item.name for item in client.list_collections()}
     if COLLECTION_NAME in existing:
         logger.warning("Replacing versioned collection '%s'.", COLLECTION_NAME)
         client.delete_collection(name=COLLECTION_NAME)
@@ -200,7 +201,7 @@ def run_ingestion(max_ms_per_category: int = 8000) -> dict[str, Any]:
     if len(chunks) > MAX_TOTAL_CHUNKS:
         microsoft_chunks = [item for item in chunks if item.source == "microsoft_codereviewer"]
         rule_chunks = [item for item in chunks if item.source != "microsoft_codereviewer"]
-        room_for_ms = max(0, MAX_TOTAL_CHUNKS - len(rule_chunks))
+        room_for_ms = min(MAX_MICROSOFT_CHUNKS, max(0, MAX_TOTAL_CHUNKS - len(rule_chunks)))
         chunks = rule_chunks + microsoft_chunks[:room_for_ms]
 
     source_counts = dict(Counter(item.source for item in chunks))
