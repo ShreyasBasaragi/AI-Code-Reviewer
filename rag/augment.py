@@ -1,15 +1,15 @@
 import logging
-from typing import List
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 
-def clean_retrieved_snippets(retrieved_context: List[str]) -> List[str]:
+def clean_retrieved_snippets(retrieved_context: Optional[List[str]]) -> List[str]:
     """
     Deduplicate and clean retrieved context snippets for augmentation.
 
     Args:
-        retrieved_context: List of raw context strings returned by retrieval.
+        retrieved_context: List of raw context strings returned by retrieval, or None.
 
     Returns:
         List of cleaned, unique context snippet strings.
@@ -38,19 +38,19 @@ def clean_retrieved_snippets(retrieved_context: List[str]) -> List[str]:
     return cleaned
 
 
-def augment_context(code: str, retrieved_context: List[str]) -> str:
+def augment_context(code: str, retrieved_context: Optional[List[str]] = None) -> str:
     """
-    Augment current code or PR diff string with top-k retrieved RAG context snippets
+    Augment current code or PR diff string with retrieved RAG context snippets
     into a structured context prompt block for downstream LLM analysis.
 
     AUGMENTATION CONTRACT:
     - 100% deterministic (no LLM, no randomness, no network API calls).
     - Preserves exact code formatting and reviewer feedback.
-    - Handles empty or duplicate retrieval outputs safely.
+    - Handles empty or None retrieval outputs safely (for ablation & no-RAG modes).
 
     Args:
         code: Current target source code or PR diff string.
-        retrieved_context: List of retrieved context snippet strings.
+        retrieved_context: Optional list of retrieved context snippet strings.
 
     Returns:
         Formatted augmented context prompt string.

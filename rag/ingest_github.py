@@ -13,6 +13,7 @@ from rag.adapters.base import CanonicalRecord
 from rag.config import (
     CHROMA_PERSIST_DIR,
     COLLECTION_NAME,
+    GITHUB_COLLECTION_NAME,
     EMBEDDING_MODEL_NAME,
 )
 
@@ -20,12 +21,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def get_chromadb_source_breakdown() -> Dict[str, int]:
+def get_chromadb_source_breakdown(collection_name: str = GITHUB_COLLECTION_NAME) -> Dict[str, int]:
     """Inspect ChromaDB collection and return document count by source tag."""
     try:
         client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
         collection = client.get_or_create_collection(
-            name=COLLECTION_NAME,
+            name=collection_name,
             embedding_function=embedding_functions.SentenceTransformerEmbeddingFunction(
                 model_name=EMBEDDING_MODEL_NAME
             ),
@@ -46,8 +47,11 @@ def get_chromadb_source_breakdown() -> Dict[str, int]:
         return {}
 
 
-def upsert_github_records_to_chromadb(records: List[CanonicalRecord]) -> int:
-    """Upsert new GitHub API canonical records idempotently into ChromaDB."""
+def upsert_github_records_to_chromadb(
+    records: List[CanonicalRecord],
+    collection_name: str = GITHUB_COLLECTION_NAME,
+) -> int:
+    """Upsert new GitHub API canonical records idempotently into isolated live collection."""
     if not records:
         logger.warning("No records to upsert into ChromaDB.")
         return 0
@@ -57,7 +61,7 @@ def upsert_github_records_to_chromadb(records: List[CanonicalRecord]) -> int:
         model_name=EMBEDDING_MODEL_NAME
     )
     collection = client.get_or_create_collection(
-        name=COLLECTION_NAME,
+        name=collection_name,
         embedding_function=embedding_fn,
         metadata={"hnsw:space": "cosine"}
     )

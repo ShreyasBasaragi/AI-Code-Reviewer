@@ -54,7 +54,7 @@ def test_end_to_end_rag_flow():
     target_code = "def process_data(val, cache={}): cache[val] = True"
 
     # Step 1: Retrieve
-    retrieved = retrieve_context(target_code, k=3)
+    retrieved = retrieve_context(target_code)
     assert isinstance(retrieved, list)
 
     # Step 2: Augment

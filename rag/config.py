@@ -17,6 +17,7 @@ CHROMA_PERSIST_DIR = DATA_DIR / "chroma_db_v2"
 # Versioned corpus: the previous critique_code_context collection is left
 # untouched so existing local data can be retained or compared.
 COLLECTION_NAME = "critique_code_context_v2"
+GITHUB_COLLECTION_NAME = "critique_github_live"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 DEFAULT_K = 4
 

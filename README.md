@@ -115,17 +115,18 @@ C:\Major-Project\
 │   ├── base.py                     # Provider-independent BaseLLM abstract class
 │   ├── qwen_client.py              # QwenLLM client with 4-bit NF4 GPU quantization
 │   └── groq_client.py              # Cloud API fallback client
-├── rag/                            # Retrieval-Augmented Generation Module
+├── rag/                            # Retrieval-Augmented Generation Module (v2)
+│   ├── adapters/                   # Data source adapters (Microsoft CodeReviewer, Security, Style)
 │   ├── data/
-│   │   ├── chroma_db/              # Persisted ChromaDB vector embeddings
-│   │   └── raw/                    # Baseline knowledge source files
-│   │       ├── style_guide.md      # Python style and engineering rules
-│   │       └── common_patterns.json# Anti-patterns (SQLi, leaks, defaults)
-│   ├── augment.py                  # Deterministic prompt augmentation builder
-│   ├── retrieve.py                 # Public retrieve_context(code, k=5) interface
-│   ├── config.py                   # Vector store configuration & protobuf guards
-│   ├── ingest.py                   # ChromaDB ingestion pipeline
-│   └── evaluate.py                 # RAG retrieval quality evaluation
+│   │   ├── chroma_db_v2/           # Persisted ChromaDB v2 vector store (<50 MB)
+│   │   ├── raw/                    # Baseline knowledge sources (CWE, OWASP, PEP8, Bandit, etc.)
+│   │   └── processed/              # Canonical chunks and build reports
+│   ├── augment.py                  # Deterministic prompt augmentation builder (context formatting)
+│   ├── retrieve.py                 # Public retrieve_context(code: str) -> list[str] interface
+│   ├── config.py                   # Vector store configuration & token limits
+│   ├── ingest.py                   # Canonical ChromaDB v2 ingestion pipeline
+│   ├── demo.py                     # Standalone RAG v2 retrieval demo across sample queries
+│   └── evaluate.py                 # RAG retrieval quality evaluation benchmark
 ├── mcp_server/                     # MCP & Integration Module
 │   ├── orchestrator.py             # Single pipeline orchestrator & Easy/Hard classifier
 │   ├── server.py                   # FastMCP stdio server (review_code, review_file, review_diff)
@@ -155,9 +156,28 @@ cd AI-Code-Reviewer
 pip install -r requirements.txt
 ```
 
-### 2. Populate RAG Vector Database
-```powershell
-python -c "from rag.ingest import load_raw_baseline_chunks, deduplicate_and_filter_records, ingest_to_chromadb; recs = load_raw_baseline_chunks(); acc, _ = deduplicate_and_filter_records(recs); ingest_to_chromadb(acc)"
+### 2. Populate RAG Vector Database (v2)
+```bash
+# 1. Fetch raw knowledge sources (CWE, OWASP, PEP 8, Google Style, Bandit)
+python scripts/fetch_reference_sources.py
+
+# 2. Fetch and prepare Microsoft CodeReviewer training split
+python scripts/fetch_microsoft_codereviewer.py
+
+# 3. Build canonical ChromaDB v2 collection (6,100 chunks, <50 MB target)
+python -m rag.ingest
+```
+
+### 3. Verify RAG v2 Retrieval & Run Tests
+```bash
+# Interactive demo across 10 code patterns
+python -m rag.demo
+
+# Run RAG retrieval benchmark (MRR, P@4, latency)
+python -m rag.evaluate
+
+# Run comprehensive test suite
+PYTHONPATH=. pytest -v tests/test_rag_v2.py rag/tests/
 ```
 
 ---

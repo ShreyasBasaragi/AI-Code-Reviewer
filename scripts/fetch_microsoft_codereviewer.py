@@ -40,7 +40,11 @@ def main() -> None:
         raise RuntimeError(f"{EXPECTED_FILE} was not found in Zenodo record 6900648.")
 
     download_url = file_info["links"]["self"]
-    archive_path = RAW / EXPECTED_FILE
+    archive_path = RAW / "microsoft_codereviewer" / EXPECTED_FILE
+    if not archive_path.exists() or archive_path.stat().st_size != file_info.get("size"):
+        archive_path = RAW / EXPECTED_FILE
+
+    expected_md5 = file_info.get("checksum", "").removeprefix("md5:")
     if not archive_path.exists() or archive_path.stat().st_size != file_info.get("size"):
         print(
             f"Downloading {EXPECTED_FILE} "
@@ -58,12 +62,19 @@ def main() -> None:
                 output.write(block)
                 digest.update(block)
 
-        expected_md5 = file_info.get("checksum", "").removeprefix("md5:")
         if expected_md5 and digest.hexdigest() != expected_md5:
             archive_path.unlink(missing_ok=True)
             raise RuntimeError("Downloaded archive failed its MD5 checksum.")
     else:
         print(f"Using existing archive: {archive_path}")
+        # Verify checksum of existing archive
+        digest = hashlib.md5()
+        with archive_path.open("rb") as f:
+            while block := f.read(1024 * 1024):
+                digest.update(block)
+        if expected_md5 and digest.hexdigest() != expected_md5:
+            raise RuntimeError("Existing archive failed its MD5 checksum.")
+        print(f"Checksum verified: {expected_md5}")
 
     output_path = TARGET / "msg-train-selected.jsonl"
     selected = 0

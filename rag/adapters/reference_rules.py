@@ -30,7 +30,21 @@ def _xml_text(element) -> str:
     return sanitize_text(" ".join(part.strip() for part in element.itertext() if part.strip()))
 
 
-def load_cwe_records(limit: int = 700) -> list[CanonicalRecord]:
+OWASP_PRIORITY_TOPICS = {
+    "sql_injection", "injection", "input_validation", "authentication",
+    "authorization", "password_storage", "session_management",
+    "cryptographic_storage", "file_upload", "command_injection",
+    "error_handling", "logging", "rest_security", "api_security",
+    "cross_site_scripting", "access_control", "json_web_token"
+}
+
+IGNORED_SECTION_TITLES = {
+    "table of contents", "introduction", "authors", "acknowledgements",
+    "references", "related articles", "license", "contributors", "overview"
+}
+
+
+def load_cwe_records(limit: int = 450) -> list[CanonicalRecord]:
     """Read weakness definitions from the official MITRE CWE XML archive."""
     if not CWE_ZIP.exists():
         logger.warning("CWE archive missing. Run scripts/fetch_reference_sources.py.")
@@ -67,13 +81,17 @@ def load_cwe_records(limit: int = 700) -> list[CanonicalRecord]:
             continue
 
         sections = [
-            f"Security weakness CWE-{cwe_id}: {name}",
-            f"Description: {description}",
+            f"SOURCE: MITRE CWE",
+            f"CWE ID: CWE-{cwe_id}",
+            f"WEAKNESS NAME: {name}",
+            f"CATEGORY: Security Vulnerability Pattern",
+            "",
+            f"DESCRIPTION:\n{description}",
         ]
-        if extended:
-            sections.append(f"Additional detail: {extended}")
+        if extended and len(extended) < 800:
+            sections.append(f"\nEXTENDED DETAILS:\n{extended}")
         if mitigations:
-            sections.append("Potential mitigations: " + " ".join(mitigations[:3]))
+            sections.append("\nMITIGATION GUIDANCE:\n" + " ".join(mitigations[:3]))
 
         records.append(
             CanonicalRecord(
@@ -82,12 +100,12 @@ def load_cwe_records(limit: int = 700) -> list[CanonicalRecord]:
                 source="owasp_cwe",
                 language="language_agnostic",
                 type="security_pattern",
-                tags=["security", "cwe", "weakness"],
+                tags=["security", "cwe", "vulnerability", name.lower().replace(" ", "_")[:30]],
                 metadata={
                     "cwe_id": str(cwe_id),
                     "weakness_name": name,
-                    "source_url": "https://cwe.mitre.org/data/definitions/",
-                    "license_note": "MITRE CWE terms of use apply",
+                    "source_url": f"https://cwe.mitre.org/data/definitions/{cwe_id}.html",
+                    "origin": "MITRE CWE",
                 },
             )
         )
@@ -114,22 +132,47 @@ def _markdown_sections(path: Path) -> Iterable[tuple[str, str]]:
             yield title, body
 
 
-def load_owasp_records(limit: int = 250) -> list[CanonicalRecord]:
-    """Convert OWASP Cheat Sheet markdown sections into source records."""
+def load_owasp_records(limit: int = 300) -> list[CanonicalRecord]:
+    """Convert OWASP Cheat Sheet markdown sections into structured security records."""
     if not OWASP_DIR.exists():
         logger.warning("OWASP source directory missing. Run scripts/fetch_reference_sources.py.")
         return []
 
     records = []
     markdown_files = sorted(OWASP_DIR.rglob("*.md"))
-    for path in markdown_files:
+
+    # Prioritize security-critical cheat sheets first
+    def _is_priority(p: Path) -> bool:
+        stem = p.stem.lower()
+        return any(k in stem for k in ["sql", "injection", "auth", "session", "crypto", "upload", "command", "error", "logging", "api", "jwt", "cross", "xss", "csrf", "validation"])
+
+    sorted_files = sorted(markdown_files, key=lambda p: (not _is_priority(p), p.name))
+
+    for path in sorted_files:
         if any(part.startswith(".") for part in path.relative_to(OWASP_DIR).parts):
             continue
-        path_key = hashlib.sha1(str(path.relative_to(OWASP_DIR)).encode("utf-8")).hexdigest()[:10]
+        path_key = hashlib.sha1(str(path.relative_to(OWASP_DIR)).encode("utf-8")).hexdigest()[:8]
+        sheet_name = path.stem.replace("_", " ").replace("-", " ")
+
         for section_index, (title, body) in enumerate(_markdown_sections(path)):
-            text = f"OWASP security guidance: {path.stem} — {title}\n{body}"
-            if len(text) < 80:
+            title_clean = title.strip().lower()
+            if any(ign in title_clean for ign in IGNORED_SECTION_TITLES):
                 continue
+
+            cleaned_body = sanitize_text(body)
+            if len(cleaned_body) < 80:
+                continue
+
+            text_parts = [
+                "SOURCE: OWASP Cheat Sheet Series",
+                f"GUIDE: {sheet_name}",
+                f"SECTION: {title}",
+                "TYPE: Security Guidance Pattern",
+                "",
+                f"RECOMMENDATION:\n{cleaned_body}",
+            ]
+            text = "\n".join(text_parts)
+
             records.append(
                 CanonicalRecord(
                     id=f"owasp_{path_key}_{section_index}",
@@ -137,13 +180,12 @@ def load_owasp_records(limit: int = 250) -> list[CanonicalRecord]:
                     source="owasp_cwe",
                     language="language_agnostic",
                     type="security_pattern",
-                    tags=["security", "owasp", "secure_coding"],
+                    tags=["security", "owasp", "secure_coding", path.stem[:25]],
                     metadata={
                         "origin": "OWASP Cheat Sheet Series",
                         "cheatsheet": path.stem,
                         "section": title,
                         "source_url": "https://cheatsheetseries.owasp.org/",
-                        "license": "CC BY-SA 4.0",
                     },
                 )
             )

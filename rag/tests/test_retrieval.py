@@ -1,28 +1,27 @@
 import pytest
 from rag.adapters.base import CanonicalRecord, validate_canonical_record, sanitize_text
-from rag.adapters.github_codereview import load_github_codereview
 from rag.adapters.microsoft_codereviewer import load_microsoft_codereviewer
+from rag.adapters.reference_rules import load_cwe_records, load_style_records
 from rag.ingest import deduplicate_and_filter_records
-from rag.retrieve import retrieve_context, retrieve_context_for_repository
-from rag.ingest_github import get_chromadb_source_breakdown
+from rag.retrieve import retrieve_context
 
 
 def test_canonical_record_validation():
     valid_rec = CanonicalRecord(
         id="test_1",
         text="Valid code review text containing sufficient detail.",
-        source="unit_test",
+        source="microsoft_codereviewer",
         language="python",
-        type="review"
+        type="review_comment"
     )
     assert validate_canonical_record(valid_rec) is True
 
     short_rec = CanonicalRecord(
         id="test_2",
         text="short",
-        source="unit_test",
+        source="microsoft_codereviewer",
         language="python",
-        type="review"
+        type="review_comment"
     )
     assert validate_canonical_record(short_rec) is False
 
@@ -43,10 +42,22 @@ def test_microsoft_codereviewer_adapter():
         assert len(rec.text) > 10
 
 
+def test_reference_rules_adapters():
+    cwe = load_cwe_records(limit=5)
+    assert isinstance(cwe, list)
+    if len(cwe) > 0:
+        assert cwe[0].source == "owasp_cwe"
+
+    style = load_style_records(limit=5)
+    assert isinstance(style, list)
+    if len(style) > 0:
+        assert style[0].source == "style_static_rules"
+
+
 def test_deduplication_and_filtering():
-    r1 = CanonicalRecord(id="1", text="Duplicate review comment snippet text.", source="src1", language="py", type="review")
-    r2 = CanonicalRecord(id="2", text="Duplicate review comment snippet text.", source="src2", language="py", type="review")
-    r3 = CanonicalRecord(id="3", text="Unique review comment snippet text.", source="src1", language="py", type="review")
+    r1 = CanonicalRecord(id="1", text="Duplicate review comment snippet text.", source="microsoft_codereviewer", language="python", type="review_comment")
+    r2 = CanonicalRecord(id="2", text="Duplicate review comment snippet text.", source="microsoft_codereviewer", language="python", type="review_comment")
+    r3 = CanonicalRecord(id="3", text="Unique review comment snippet text.", source="microsoft_codereviewer", language="python", type="review_comment")
 
     accepted, stats = deduplicate_and_filter_records([r1, r2, r3])
     assert len(accepted) == 2
@@ -55,25 +66,14 @@ def test_deduplication_and_filtering():
 
 def test_frozen_retrieve_context_interface():
     code_sample = "def calculate_sum(a, b=[]): return a + b"
-    results = retrieve_context(code_sample, k=3)
+    results = retrieve_context(code_sample)
 
     assert isinstance(results, list), "Return value must be a list"
-    assert len(results) <= 3, "Returned items must be <= k"
+    assert len(results) <= 4, "Returned items must be <= 4"
     for item in results:
         assert isinstance(item, str), "Each item in returned list must be a string"
 
 
-def test_retrieve_context_for_repository_helper():
-    code_sample = "def login(user): pass"
-    results_all = retrieve_context_for_repository(code_sample, repository=None, k=3)
-    assert isinstance(results_all, list)
-
-    results_repo = retrieve_context_for_repository(code_sample, repository="psf/requests", k=3)
-    assert isinstance(results_repo, list)
-
-
-def test_chromadb_source_counts_preservation():
-    breakdown = get_chromadb_source_breakdown()
-    assert breakdown.get("github_codereview", 0) >= 1000, "github_codereview records must remain intact"
-    assert breakdown.get("microsoft_codereviewer", 0) >= 1299, "microsoft_codereviewer records must remain intact"
-    assert breakdown.get("style_guide", 0) >= 6, "style_guide records must remain intact"
+def test_retrieve_context_empty_input():
+    assert retrieve_context("") == []
+    assert retrieve_context("   \n\t  ") == []

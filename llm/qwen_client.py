@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen2.5-Coder-3B-Instruct"
 DEFAULT_ADAPTER_DIR = Path(__file__).resolve().parent / "model"
+DEFAULT_INPUT_BUDGET = 768
 
 
 class QwenLLM(BaseLLM):
@@ -37,8 +38,12 @@ class QwenLLM(BaseLLM):
         # Setup compute device
         if device:
             self.device = device
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
         else:
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.device = "cpu"
 
         logger.info(f"Initializing QwenLLM on device: {self.device}")
         logger.info(f"Base model: {self.base_model_name}")
@@ -48,6 +53,8 @@ class QwenLLM(BaseLLM):
         if self.device == "cuda":
             # bfloat16 is optimal on Ampere (RTX 3000+) or newer, float16 as fallback
             dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        elif self.device == "mps":
+            dtype = torch.float16
         else:
             dtype = torch.float32
 
@@ -116,10 +123,16 @@ class QwenLLM(BaseLLM):
         self.model.eval()
         logger.info("QwenLLM initialized and ready for code review inference.")
 
-    def _build_messages(self, code: str, context: List[str]) -> List[dict]:
-        """Construct conversation messages with RAG context."""
-        augmented_prompt = augment_context(code, context)
-
+    def _build_messages(
+        self,
+        code: str,
+        context: Optional[List[str]] = None,
+        max_input_tokens: int = DEFAULT_INPUT_BUDGET,
+    ) -> List[dict]:
+        """
+        Construct conversation messages enforcing the 768-token inference input budget.
+        Preserves system prompt and target code; selectively adds context in relevance order.
+        """
         system_instruction = (
             "You are Critique, an expert autonomous AI code reviewer.\n"
             "Analyze the given code or pull request diff precisely.\n"
@@ -134,27 +147,56 @@ class QwenLLM(BaseLLM):
             "Recommendation: <actionable guidance and corrected code example>"
         )
 
-        messages = [
+        candidate_snippets = list(context or [])
+        fitted_snippets: List[str] = []
+
+        # Progressively include context items in top-to-bottom relevance order
+        # while keeping prompt token count strictly within the configured budget.
+        for snippet in candidate_snippets:
+            test_snippets = fitted_snippets + [snippet]
+            test_prompt = augment_context(code, test_snippets)
+            test_messages = [
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": test_prompt},
+            ]
+            token_count = len(
+                self.tokenizer.apply_chat_template(
+                    test_messages, tokenize=True, add_generation_prompt=True
+                )
+            )
+            if token_count <= max_input_tokens:
+                fitted_snippets.append(snippet)
+            else:
+                logger.debug(
+                    "Context snippet omitted to respect %d token input budget (tokens=%d).",
+                    max_input_tokens,
+                    token_count,
+                )
+                break
+
+        final_prompt = augment_context(code, fitted_snippets if fitted_snippets else None)
+        return [
             {"role": "system", "content": system_instruction},
-            {"role": "user", "content": augmented_prompt}
+            {"role": "user", "content": final_prompt},
         ]
-        return messages
 
     def analyze_code(
         self,
         code: str,
-        context: List[str],
+        context: Optional[List[str]] = None,
         max_new_tokens: int = 512,
         temperature: float = 0.2,
         top_p: float = 0.9,
+        max_input_tokens: int = DEFAULT_INPUT_BUDGET,
     ) -> str:
         """
         Analyze code using retrieved RAG context and the fine-tuned Qwen model.
+        Supports context=None and context=[] for no-RAG ablation condition.
         """
         if not code or not code.strip():
             return "No code provided for review."
 
-        messages = self._build_messages(code, context)
+        messages = self._build_messages(code, context, max_input_tokens=max_input_tokens)
         prompt_text = self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,

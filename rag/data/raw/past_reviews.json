@@ -1,0 +1,26 @@
+[
+  {
+    "id": "review_001",
+    "topic": "Type Hints & Validation",
+    "snippet": "def get_user_by_id(user_id): return db.query(User).filter_by(id=user_id).first()",
+    "review_comment": "Consider adding type annotations (e.g. `user_id: int -> Optional[User]`) and validating that `user_id` is a positive integer before hitting the database."
+  },
+  {
+    "id": "review_002",
+    "topic": "Error Handling & Logging",
+    "snippet": "try:\n    response = requests.get(url)\n    return response.json()\nexcept Exception:\n    return {}",
+    "review_comment": "Catching generic `Exception` and returning an empty dict silently hides HTTP timeouts or connection failures. Log the exception and catch `requests.RequestException` specifically."
+  },
+  {
+    "id": "review_003",
+    "topic": "Code Complexity & Function Size",
+    "snippet": "def process_checkout_cart(cart, user, payment_info, shipping_info, promo_code, refer_id):\n    # 100+ lines of nested if-else blocks...",
+    "review_comment": "This function handles cart validation, promo calculation, payment gateway call, and inventory update all in one place. Break this down into smaller dedicated domain handlers."
+  },
+  {
+    "id": "review_004",
+    "topic": "Hardcoded Configuration / API Credentials",
+    "snippet": "API_KEY = 'sk_live_983749283749283749'\nclient = StripeClient(api_key=API_KEY)",
+    "review_comment": "Security risk: Never commit API credentials to source control. Load `API_KEY` from `os.getenv('STRIPE_API_KEY')` or environment configuration."
+  }
+]

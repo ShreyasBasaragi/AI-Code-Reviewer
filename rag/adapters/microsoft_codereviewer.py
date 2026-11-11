@@ -3,7 +3,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
-from rag.adapters.base import CanonicalRecord, sanitize_text, validate_canonical_record
+from rag.adapters.base import CanonicalRecord, sanitize_text, validate_canonical_record, generate_record_id
 from rag.config import RAW_DATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -31,16 +31,46 @@ def _map_language(lang_ext: Optional[str]) -> str:
     return mapping.get(ext_clean, ext_clean)
 
 
-def parse_comment_generation_files(dir_path: Path, max_records: Optional[int] = 500) -> List[CanonicalRecord]:
-    """Parse Comment_Generation JSONL files (msg-*.jsonl)."""
+def _detect_language(lang_field: Optional[str], text_content: str) -> str:
+    """Determine language from record field or heuristics on patch/code content."""
+    if lang_field:
+        mapped = _map_language(lang_field)
+        if mapped != "unknown":
+            return mapped
+
+    sample = text_content[:2000]
+    if any(kw in sample for kw in ("def ", "import ", "self.", "class ", "elif ", "except:", "except ")):
+        return "python"
+    if any(kw in sample for kw in ("#include", "std::", "nullptr", "boost::")):
+        return "cpp"
+    if any(kw in sample for kw in ("public class", "public static void", "System.out.println")):
+        return "java"
+    if any(kw in sample for kw in ("func ", "package ", "fmt.Print")):
+        return "go"
+    if any(kw in sample for kw in ("const ", "let ", "function(", "export default", "=>")):
+        return "javascript"
+    if any(kw in sample for kw in ("def ", "attr_accessor", "require '", "end\n")):
+        return "ruby"
+    return "language_agnostic"
+
+
+def parse_comment_generation_files(dir_path: Path, max_records: Optional[int] = 8000) -> List[CanonicalRecord]:
+    """Parse Comment_Generation training JSONL files (msg-train*.jsonl)."""
     records: List[CanonicalRecord] = []
     if not dir_path.exists():
         return records
 
-    # Only training files are permitted in the retrieval corpus. Validation and test\n    # files are reserved for evaluation and must never be ingested.\n    jsonl_files = sorted(dir_path.glob("msg-train*.jsonl"))
+    # Strictly only training files are permitted in the retrieval corpus.
+    # Validation and test files (msg-valid*, msg-test*) must NEVER be ingested.
+    # If msg-train-selected.jsonl exists, use it first; otherwise check msg-train*.jsonl.
+    selected_file = dir_path / "msg-train-selected.jsonl"
+    if selected_file.exists():
+        jsonl_files = [selected_file]
+    else:
+        jsonl_files = sorted(dir_path.glob("msg-train*.jsonl"))
 
     for file_path in jsonl_files:
-        logger.info(f"Parsing Microsoft Comment_Generation file: {file_path.name}")
+        logger.info(f"Parsing Microsoft Comment_Generation training file: {file_path.name}")
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line_idx, line in enumerate(f):
                 if max_records and len(records) >= max_records:
@@ -57,21 +87,31 @@ def parse_comment_generation_files(dir_path: Path, max_records: Optional[int] = 
                 msg = sanitize_text(data.get("msg", ""))
                 oldf = sanitize_text(data.get("oldf", ""))
                 proj = data.get("proj", "unknown")
-                lang = _map_language(data.get("lang"))
-                # Use file stem + line index to guarantee globally unique ID
-                rec_id = f"ms_msg_{file_path.stem}_{line_idx}"
+                line_key = f"{file_path.stem}_{line_idx}"
+                raw_id = data.get("id")
+                orig_id = f"{line_key}_{raw_id}" if raw_id is not None else line_key
 
+                # Reject records with missing reviewer comments or missing associated patches
                 if not msg or not patch:
                     continue
+                if len(msg) < 5 or len(patch) < 10:
+                    continue
 
+                lang = _detect_language(data.get("lang"), f"{patch}\n{oldf}")
+                rec_id = generate_record_id("ms_review", orig_id)
+
+                # Format as canonical document associating reviewer comment with code context
                 text_parts = [
-                    f"Microsoft CodeReviewer Feedback ({lang}):",
-                    f"Reviewer Comment: {msg}",
-                    f"Project: {proj}",
-                    f"Code Diff Patch:\n{patch}"
+                    "SOURCE: Microsoft CodeReviewer",
+                    f"LANGUAGE: {lang.capitalize()}",
+                    "TYPE: Historical Code Review",
+                    "",
+                    f"REVIEWER COMMENT:\n{msg}",
+                    "",
+                    f"CODE CONTEXT / PATCH:\n{patch}",
                 ]
-                if oldf and len(oldf) < 1500:
-                    text_parts.append(f"Original Code:\n{oldf[:1000]}")
+                if oldf and len(oldf) < 800:
+                    text_parts.append(f"\nORIGINAL CODE SNIPPET:\n{oldf[:500]}")
 
                 full_text = "\n".join(text_parts)
 
@@ -80,13 +120,13 @@ def parse_comment_generation_files(dir_path: Path, max_records: Optional[int] = 
                     text=full_text,
                     source="microsoft_codereviewer",
                     language=lang,
-                    type="comment_generation",
-                    tags=[lang, "comment_generation"],
+                    type="review_comment",
+                    tags=["historical_review", "codereviewer", lang],
                     metadata={
                         "project": proj,
-                        "original_id": data.get("id"),
+                        "original_id": orig_id,
                         "category": "Comment_Generation",
-                        "file_source": file_path.name
+                        "file_source": file_path.name,
                     }
                 )
 
@@ -238,11 +278,12 @@ def parse_code_refinement_files(dir_path: Path, max_records: Optional[int] = 300
 
 def load_microsoft_codereviewer(
     base_dir: Path = MS_CODEREVIEWER_DIR,
-    max_per_category: int = 500
+    max_per_category: int = 8000
 ) -> List[CanonicalRecord]:
     """
-    Load and aggregate Microsoft CodeReviewer records across all category subdirectories.
-    Prioritizes Comment_Generation and Diff_Quality_Estimation, with Code_Refinement as secondary.
+    Load Microsoft CodeReviewer training records from Comment_Generation split.
+    Guarantees only training records are ingested; test and validation splits are never loaded.
+    Target: 5,000–10,000 final indexed chunks.
     """
     if not base_dir.exists():
         logger.warning(f"Microsoft CodeReviewer directory not found at: {base_dir}")
@@ -251,13 +292,5 @@ def load_microsoft_codereviewer(
     comment_gen_records = parse_comment_generation_files(
         base_dir / "Comment_Generation", max_records=max_per_category
     )
-    quality_est_records = parse_diff_quality_files(
-        base_dir / "Diff_Quality_Estimation", max_records=max_per_category
-    )
-    code_refine_records = parse_code_refinement_files(
-        base_dir / "Code_Refinement", max_records=int(max_per_category * 0.6)
-    )
-
-    all_ms_records = comment_gen_records + quality_est_records + code_refine_records
-    logger.info(f"Loaded {len(all_ms_records)} total canonical records from Microsoft CodeReviewer dataset.")
-    return all_ms_records
+    logger.info(f"Loaded {len(comment_gen_records)} training records from Microsoft Comment_Generation.")
+    return comment_gen_records

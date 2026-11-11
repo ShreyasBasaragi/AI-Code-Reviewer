@@ -299,7 +299,7 @@ def run_review_pipeline(
     try:
         from rag.retrieve import retrieve_context
         logger.info("[Step 1/5] Retrieving RAG context from ChromaDB...")
-        retrieved_context = retrieve_context(code, k=5)
+        retrieved_context = retrieve_context(code)
         logger.info(f"  -> Retrieved {len(retrieved_context)} context snippets.")
     except Exception as e:
         # RAG failure is non-fatal  -- proceed with empty context
