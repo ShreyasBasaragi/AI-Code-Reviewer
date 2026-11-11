@@ -37,7 +37,7 @@ def parse_comment_generation_files(dir_path: Path, max_records: Optional[int] = 
     if not dir_path.exists():
         return records
 
-    jsonl_files = sorted(dir_path.glob("msg-valid.jsonl")) + sorted(dir_path.glob("msg-test.jsonl")) + sorted(dir_path.glob("msg-train*.jsonl"))
+    # Only training files are permitted in the retrieval corpus. Validation and test\n    # files are reserved for evaluation and must never be ingested.\n    jsonl_files = sorted(dir_path.glob("msg-train*.jsonl"))
 
     for file_path in jsonl_files:
         logger.info(f"Parsing Microsoft Comment_Generation file: {file_path.name}")
@@ -105,7 +105,7 @@ def parse_diff_quality_files(dir_path: Path, max_records: Optional[int] = 500) -
     if not dir_path.exists():
         return records
 
-    jsonl_files = sorted(dir_path.glob("cls-valid.jsonl")) + sorted(dir_path.glob("cls-test.jsonl")) + sorted(dir_path.glob("cls-train*.jsonl"))
+    # Only training files are permitted in the retrieval corpus.\n    jsonl_files = sorted(dir_path.glob("cls-train*.jsonl"))
 
     for file_path in jsonl_files:
         logger.info(f"Parsing Microsoft Quality_Estimation file: {file_path.name}")
@@ -173,7 +173,7 @@ def parse_code_refinement_files(dir_path: Path, max_records: Optional[int] = 300
     if not dir_path.exists():
         return records
 
-    jsonl_files = sorted(dir_path.glob("ref-valid.jsonl")) + sorted(dir_path.glob("ref-test.jsonl")) + sorted(dir_path.glob("ref-train*.jsonl"))
+    # Only training files are permitted in the retrieval corpus.\n    jsonl_files = sorted(dir_path.glob("ref-train*.jsonl"))
 
     for file_path in jsonl_files:
         logger.info(f"Parsing Microsoft Code_Refinement file: {file_path.name}")
