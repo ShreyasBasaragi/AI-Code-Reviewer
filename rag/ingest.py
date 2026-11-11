@@ -41,6 +41,8 @@ CHUNK_OVERLAP_TOKENS = 20
 BATCH_SIZE = 256
 MAX_TOTAL_CHUNKS = 12_000
 MAX_MICROSOFT_CHUNKS = 10_000
+MAX_SECURITY_CHUNKS = 1_000
+MAX_STYLE_CHUNKS = 500
 TARGET_MIN_CHUNKS = 6_000
 MAX_DB_BYTES = 50 * 1024 * 1024
 
@@ -197,12 +199,21 @@ def run_ingestion(max_ms_per_category: int = 8000) -> dict[str, Any]:
     tokenizer = _load_tokenizer()
     chunks, quality = prepare_records(source_records, tokenizer)
 
-    # Bound the total corpus without changing the security/style quotas.
+    # Enforce the teammate's category quotas after tokenization, because long
+    # source documents can expand into multiple chunks.
+    microsoft_chunks = [
+        item for item in chunks if item.source == "microsoft_codereviewer"
+    ][:MAX_MICROSOFT_CHUNKS]
+    security_chunks = [
+        item for item in chunks if item.source == "owasp_cwe"
+    ][:MAX_SECURITY_CHUNKS]
+    style_chunks = [
+        item for item in chunks if item.source == "style_static_rules"
+    ][:MAX_STYLE_CHUNKS]
+    chunks = microsoft_chunks + security_chunks + style_chunks
+
     if len(chunks) > MAX_TOTAL_CHUNKS:
-        microsoft_chunks = [item for item in chunks if item.source == "microsoft_codereviewer"]
-        rule_chunks = [item for item in chunks if item.source != "microsoft_codereviewer"]
-        room_for_ms = min(MAX_MICROSOFT_CHUNKS, max(0, MAX_TOTAL_CHUNKS - len(rule_chunks)))
-        chunks = rule_chunks + microsoft_chunks[:room_for_ms]
+        chunks = chunks[:MAX_TOTAL_CHUNKS]
 
     source_counts = dict(Counter(item.source for item in chunks))
     total = len(chunks)
