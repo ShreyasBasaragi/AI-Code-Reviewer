@@ -55,9 +55,9 @@ def _get_collection():
 
 
 def retrieve_context(code: str) -> list[str]:
-    """Return the three most relevant context chunks for a code snippet.
+    """Return the four most relevant context chunks for a code snippet.
 
-    This is the stable integration interface. It returns up to three chunks and performs read-only retrieval
+    This is the stable integration interface. It returns up to four chunks and performs read-only retrieval
     and has no ingestion, collection-creation, or filesystem side effects.
     """
     if not isinstance(code, str) or not code.strip():
