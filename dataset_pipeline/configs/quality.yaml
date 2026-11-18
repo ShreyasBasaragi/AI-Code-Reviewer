@@ -1,0 +1,7 @@
+quality_policy_version: "1.0"
+exact_fingerprint: sha256-canonical-json-v1
+near_duplicate_search: disabled
+conflict_policy: quarantine_without_relabeling
+missing_label_policy: preserve_null_and_ineligible
+severity_inference: forbidden
+defect_inference_from_review_comments: forbidden

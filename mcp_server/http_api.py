@@ -1,0 +1,1166 @@
+"""FastAPI transport for the existing review and fix lifecycle services."""
+
+from __future__ import annotations
+
+import os
+import time
+import uuid
+import hmac
+from contextlib import asynccontextmanager
+from dataclasses import asdict
+from threading import BoundedSemaphore, RLock
+from typing import Literal, Optional
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, ConfigDict, Field
+from mcp_server.admin_auth import AdminAuthError, AdminAuthStore, SESSION_TTL_SECONDS
+from mcp_server.credential_store import CREDENTIALS, CredentialStore, CredentialStoreError
+
+from fix_lifecycle import record_verification
+from mcp_server import orchestrator
+from mcp_server.github_pr import GitHubPRException, GitHubPRReviewService
+from mcp_server.github_pr import GitHubRESTClient
+from mcp_server.github_webhook import (
+    GitHubWebhookProcessor,
+    WebhookDeliveryStore,
+    WebhookError,
+    parse_delivery,
+    verify_signature,
+    verify_status_token,
+)
+from mcp_server.github_action_coordinator import GitHubActionCoordinator
+from mcp_server.state import LifecycleState, PROCESS_STATE
+from review_schema import ReviewResponse
+
+MAX_CODE_BYTES = 512 * 1024
+DEFAULT_WEBHOOK_BODY_LIMIT = 1024 * 1024
+
+
+class ReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    code: str = Field(min_length=1, max_length=200_000)
+    language: Literal["python"] = "python"
+
+
+class FixRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    language: Literal["python"] = "python"
+
+
+class GitHubPRReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    url: str = Field(min_length=1, max_length=2048)
+
+
+class ProviderSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    review_provider: Optional[Literal["groq", "qwen_local", "qwen"]] = None
+    fix_provider: Optional[Literal["groq", "qwen_local", "qwen"]] = None
+    groq_model: Optional[str] = Field(default=None, max_length=120)
+    groq_api_key: Optional[str] = Field(default=None, max_length=512)
+    qwen_base_model: Optional[str] = Field(default=None, max_length=120)
+    qwen_adapter_path: Optional[str] = Field(default=None, max_length=1024)
+    qwen_quantization: Optional[Literal["none"]] = None
+    review_temperature: Optional[float] = None
+    fix_temperature: Optional[float] = None
+    max_output_tokens: Optional[int] = None
+    source_sharing_consent: Optional[bool] = None
+
+
+class AdminSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    password: Optional[str] = Field(default=None, min_length=1, max_length=1024)
+    admin_token: Optional[str] = Field(default=None, min_length=32, max_length=512)
+
+
+class AdminSetupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    bootstrap_credential: str = Field(min_length=24, max_length=256)
+    password: str = Field(min_length=12, max_length=1024)
+    password_confirmation: str = Field(min_length=12, max_length=1024)
+
+
+class AdminRecoveryRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    recovery_credential: str = Field(min_length=24, max_length=256)
+    password: str = Field(min_length=12, max_length=1024)
+    password_confirmation: str = Field(min_length=12, max_length=1024)
+
+
+class GitHubCredentialRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    credential_type: Literal["github_token", "github_actions_token", "webhook_secret"]
+    value: str = Field(min_length=1, max_length=4096)
+    persistent: bool = True
+
+
+class RepositoryPolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    revision: str = Field(min_length=64, max_length=64)
+    publish_review_comments: bool = False
+    enable_autonomous_fixes: bool = False
+    allowed_low_risk_categories: list[str] = Field(default_factory=list, max_length=3)
+    confidence_threshold: float = Field(default=0.80, ge=0.80, le=1.0)
+    max_changed_lines: int = Field(default=3, ge=1, le=3)
+    protected_paths: list[str] = Field(default_factory=lambda: [".github/", "migrations/", "infra/", "security/", "auth/"], max_length=100)
+    permitted_branches: list[str] = Field(default_factory=list, max_length=100)
+    required_checks: list[str] = Field(default_factory=lambda: ["syntax", "static", "behavioral", "ci"], max_length=4)
+    allow_source_sharing: bool = False
+    required_github_checks: list[str] = Field(default_factory=list, max_length=100)
+
+
+_PR_REVIEW_SLOT = BoundedSemaphore(1)
+
+
+class ReviewFixService:
+    """Thin adapter around the shared orchestrator and shared process cache."""
+
+    def __init__(
+        self,
+        *,
+        llm=None,
+        retriever=None,
+        state: LifecycleState = PROCESS_STATE,
+        provider_name: Optional[str] = None,
+        github_pr_service: Optional[GitHubPRReviewService] = None,
+    ) -> None:
+        self._injected_llm = llm
+        self.retriever = retriever
+        self.state = state
+        self.provider_name = provider_name
+        self._provider = llm
+        self._fix_provider = llm
+        self.github_pr_service = github_pr_service or GitHubPRReviewService()
+
+    def configured_provider_name(self, task: str = "review") -> str:
+        if task not in {"review", "fix"}:
+            raise ValueError("Provider task must be 'review' or 'fix'.")
+        if task == "review" and self.provider_name:
+            name = self.provider_name.strip().casefold()
+        elif task == "fix" and self.provider_name and not os.getenv("AI_CODE_REVIEWER_FIX_PROVIDER"):
+            name = self.provider_name.strip().casefold()
+        else:
+            from llm.provider_settings import PROVIDER_SETTINGS
+
+            name = PROVIDER_SETTINGS.public_snapshot()[f"{task}_provider"]
+        return "qwen_local" if name == "qwen" else name
+
+    @property
+    def provider_initialized(self) -> bool:
+        return self._provider is not None or self._fix_provider is not None
+
+    def _get_provider(self, task: str = "review"):
+        attribute = "_provider" if task == "review" else "_fix_provider"
+        if self._injected_llm is not None:
+            return self._injected_llm
+        from llm.provider_factory import get_configured_provider, get_provider
+        from llm.provider_settings import PROVIDER_SETTINGS, ProviderSettingsError
+
+        if (self.configured_provider_name(task) == "groq"
+                and not PROVIDER_SETTINGS.public_snapshot()["source_sharing_consent"]):
+            raise ProviderSettingsError("source_sharing_not_authorized")
+
+        if self.provider_name:
+            current = getattr(self, attribute)
+            if current is not None:
+                return current
+            provider = get_provider(self.configured_provider_name(task))
+        else:
+            # Resolve one immutable settings snapshot per request. The factory
+            # caches by settings generation so later requests see authorized
+            # changes while an in-flight provider call keeps its own instance.
+            provider = get_configured_provider(task)
+        setattr(self, attribute, provider)
+        return provider
+
+    def provider_identity(self, task: str = "review") -> str:
+        provider = getattr(self, "_provider" if task == "review" else "_fix_provider")
+        if self._injected_llm is not None:
+            return f"injected:{type(provider).__name__}" if provider is not None else "injected:configured"
+        if provider is not None:
+            model = getattr(provider, "model", None)
+            if isinstance(model, str) and model:
+                return f"{self.configured_provider_name(task)}:{model}"
+            config = getattr(provider, "config", None)
+            model_id = getattr(config, "base_model_id", None)
+            if isinstance(model_id, str) and model_id:
+                return f"{self.configured_provider_name(task)}:{model_id}"
+        return self.configured_provider_name(task)
+
+    def submit_review(self, code: str) -> tuple[str, ReviewResponse]:
+        review_id, review, _timings = self.submit_review_with_timings(code)
+        return review_id, review
+
+    def submit_review_with_timings(self, code: str) -> tuple[str, ReviewResponse, dict[str, float]]:
+        request_started = time.perf_counter()
+        self._validate_code(code)
+        timings = {"request_validation_seconds": time.perf_counter() - request_started}
+        provider = self._get_provider("review")
+        result = orchestrator.run_review_pipeline(
+            code=code,
+            file_path="submitted.py",
+            notify_desktop=False,
+            llm=provider,
+            retriever=self.retriever,
+            phase_timings=timings,
+        )
+        review_id = uuid.uuid4().hex
+        self.state.put_review(review_id, code, result.review_response)
+        timings["total_request_seconds"] = time.perf_counter() - request_started
+        return review_id, result.review_response, dict(timings)
+
+    def review_github_pr(self, url: str, *, expected_owner: Optional[str] = None,
+                         expected_repository: Optional[str] = None,
+                         expected_number: Optional[int] = None,
+                         expected_base_sha: Optional[str] = None,
+                         expected_head_sha: Optional[str] = None):
+        # Preserve an explicitly injected PR reviewer for offline tests and
+        # deployments that supply their own review adapter. Production defaults
+        # to the existing orchestrator path through _review_pr_file.
+        from mcp_server.github_policy import load_repository_action_config
+        from mcp_server.github_pr import parse_pull_request_url
+
+        injected = self.github_pr_service.reviewer
+        ref = parse_pull_request_url(url)
+        repository = f"{ref.owner}/{ref.repository}".casefold()
+        provider_name = self.configured_provider_name("review")
+        configs = load_repository_action_config()
+        if not injected and self._injected_llm is None and provider_name == "groq" and not bool(
+                configs.get(repository) and configs[repository].allow_source_sharing):
+            raise GitHubPRException("source_sharing_not_authorized", 403,
+                                    "Administrator source-sharing consent is required for hosted PR review.")
+        # One provider object is captured for the full PR review so an admin
+        # settings change cannot split files from one review across providers.
+        provider = None if injected else self._get_provider("review")
+        callback = injected or (lambda code, path: self._review_pr_file(code, path, provider))
+        result = self.github_pr_service.analyze(
+            url, reviewer=callback,
+            context_reviewer=None if injected else (
+                lambda code, path, evidence: self._review_pr_file_with_context(code, path, evidence, provider)
+            ),
+            expected_owner=expected_owner, expected_repository=expected_repository,
+            expected_number=expected_number, expected_base_sha=expected_base_sha,
+            expected_head_sha=expected_head_sha,
+        )
+        if injected:
+            result.provider_identity = "injected:github_reviewer"
+        else:
+            result.provider_identity = self.provider_identity("review")
+        return result
+
+    def _review_pr_file(self, code: str, file_path: str, provider=None) -> ReviewResponse:
+        result = orchestrator.run_review_pipeline(
+            code=code,
+            file_path=file_path,
+            notify_desktop=False,
+            llm=provider or self._get_provider("review"),
+            retriever=self.retriever,
+        )
+        return result.review_response
+
+    def _review_pr_file_with_context(self, code: str, file_path: str,
+                                     supplemental_evidence, provider=None) -> ReviewResponse:
+        result = orchestrator.run_review_pipeline(
+            code=code,
+            file_path=file_path,
+            notify_desktop=False,
+            llm=provider or self._get_provider("review"),
+            retriever=self.retriever,
+            supplemental_evidence=supplemental_evidence,
+        )
+        return result.review_response
+
+    def get_review(self, review_id: str):
+        return self.state.get_review(review_id)
+
+    def generate_fix(self, review_id: str, finding_id: str, language: str = "python"):
+        handle = self.state.get_review(review_id)
+        if handle is None:
+            raise LookupError("review_not_found")
+        candidate = orchestrator.generate_fix_candidate(
+            review_response=handle.response,
+            finding_ref=finding_id,
+            original_code=handle.code,
+            language=language,
+            llm=self._get_provider("fix"),
+        )
+        if candidate.generation_status == "generated":
+            from dataclasses import replace
+            candidate = replace(candidate, provider_identity=self.provider_identity("fix"))
+        if candidate.generation_status == "generated":
+            self.state.put_candidate(candidate)
+        return candidate
+
+    def get_candidate(self, candidate_id: str):
+        return self.state.get_candidate(candidate_id)
+
+    def verify(self, candidate_id: str):
+        candidate = self.get_candidate(candidate_id)
+        if candidate is None:
+            raise LookupError("candidate_not_found")
+        report = orchestrator.verify_fix_candidate(
+            candidate, expected_candidate_id=candidate_id
+        )
+        self.state.put_candidate(record_verification(candidate, report))
+        return report
+
+    def accept(self, candidate_id: str):
+        return self._approval(candidate_id, orchestrator.accept_fix)
+
+    def reject(self, candidate_id: str):
+        return self._approval(candidate_id, orchestrator.reject_fix)
+
+    def _approval(self, candidate_id: str, action):
+        candidate = self.get_candidate(candidate_id)
+        if candidate is None:
+            raise LookupError("candidate_not_found")
+        result = action(candidate)
+        self.state.put_candidate(result.candidate)
+        return result
+
+    def export(self, candidate_id: str):
+        candidate = self.get_candidate(candidate_id)
+        if candidate is None:
+            raise LookupError("candidate_not_found")
+        return orchestrator.export_fix(candidate)
+
+    @staticmethod
+    def _validate_code(code: str) -> None:
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("code_required")
+        if len(code.encode("utf-8")) > MAX_CODE_BYTES:
+            raise OverflowError("code_too_large")
+
+
+def _review_payload(review: ReviewResponse) -> dict:
+    # Exclude raw model text and internal exception messages from HTTP responses.
+    return {
+        "valid": review.valid,
+        "summary": review.summary,
+        "findings": [asdict(item) for item in review.findings],
+        "evidence": [asdict(item) for item in review.evidence],
+        "processing_errors": ["review_validation_failed"] if not review.valid else [],
+        "static_analysis_status": review.static_analysis_status,
+        "static_analysis_error": review.static_analysis_error,
+    }
+
+
+def _candidate_payload(candidate) -> dict:
+    payload = candidate.to_dict()
+    payload.pop("raw_response", None)
+    return payload
+
+
+def create_app(service: Optional[ReviewFixService] = None,
+               webhook_processor: Optional[GitHubWebhookProcessor] = None,
+               admin_auth: Optional[AdminAuthStore] = None,
+               credentials: Optional[CredentialStore] = None) -> FastAPI:
+    """Create the HTTP API; provider/model construction remains lazy."""
+    lifecycle = service or ReviewFixService()
+    auth_store = admin_auth or AdminAuthStore()
+    credential_store = credentials or CREDENTIALS
+    delivery_store = WebhookDeliveryStore.from_environment()
+    action_coordinator = GitHubActionCoordinator(
+        delivery_store,
+        read_client=getattr(getattr(lifecycle, "github_pr_service", None), "client", None),
+    )
+
+    def process_webhook_event(event):
+        _apply_github_credentials(lifecycle, credential_store, action_coordinator, include_action=True)
+        from mcp_server.github_policy import load_repository_action_config
+        action_coordinator.configs = load_repository_action_config()
+        return _run_webhook_review(lifecycle, event, action_coordinator)
+
+    processor = webhook_processor or GitHubWebhookProcessor(
+        delivery_store,
+        process_webhook_event,
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app):
+        bootstrap = auth_store.startup()
+        _print_startup_summary(auth_store, credential_store, bootstrap)
+        try:
+            webhook_configured = bool(credential_store.get("webhook_secret"))
+        except CredentialStoreError:
+            webhook_configured = False
+        if webhook_configured:
+            processor.start()
+        try:
+            yield
+        finally:
+            processor.stop()
+
+    app = FastAPI(title="AI Code Reviewer API", version="1.0.0", lifespan=lifespan)
+    login_attempts: dict[str, list[float]] = {}
+    login_lock = RLock()
+
+    @app.exception_handler(RequestValidationError)
+    async def sanitize_admin_validation_errors(request: Request, exc: RequestValidationError):
+        if request.url.path.startswith("/api/admin/"):
+            # Pydantic's default validation detail may echo the rejected input,
+            # which could include a credential sent with this request.
+            return JSONResponse(status_code=422, content={"detail": "provider_settings_invalid"})
+        return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    origins = [
+        origin.strip()
+        for origin in os.getenv(
+            "AI_CODE_REVIEWER_CORS_ORIGINS",
+            "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+        ).split(",")
+        if origin.strip() and origin.strip() != "*"
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
+        allow_headers=["Content-Type", "Authorization"],
+    )
+
+    def require_admin(request: Request) -> str:
+        cookie = request.cookies.get("acr_admin_session")
+        if auth_store.valid_session(cookie):
+            if request.method not in {"GET", "HEAD"} and request.headers.get("origin") not in origins:
+                raise HTTPException(status_code=403, detail="admin_origin_not_allowed")
+            return "session"
+        configured = os.getenv("AI_CODE_REVIEWER_ADMIN_TOKEN")
+        supplied = request.headers.get("authorization", "")
+        if configured and len(configured) >= 32 and hmac.compare_digest(supplied, "Bearer " + configured):
+            return "legacy_bearer"
+        raise HTTPException(status_code=401, detail="provider_settings_unauthorized")
+
+    def require_loopback_peer(request: Request) -> str:
+        host = (request.client.host if request.client else "").casefold()
+        if any(request.headers.get(header) for header in ("forwarded", "x-forwarded-for", "x-real-ip")):
+            raise HTTPException(status_code=403, detail="forwarded_peer_headers_not_allowed_for_local_setup")
+        request_host = (request.url.hostname or "").casefold()
+        if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+            raise HTTPException(status_code=403, detail="local_administrator_action_required")
+        if host != "testclient" and request_host not in {"127.0.0.1", "::1", "localhost"}:
+            raise HTTPException(status_code=403, detail="local_administrator_action_required")
+        origin = request.headers.get("origin")
+        if origin and origin not in origins:
+            raise HTTPException(status_code=403, detail="admin_origin_not_allowed")
+        return host or "loopback"
+
+    def set_admin_cookie(request: Request, token: str, ttl: int = SESSION_TTL_SECONDS) -> JSONResponse:
+        result = JSONResponse({"authenticated": True, "expires_in_seconds": ttl})
+        result.set_cookie("acr_admin_session", token, max_age=ttl, httponly=True,
+                          secure=request.url.scheme == "https", samesite="strict",
+                          path="/api/admin")
+        return result
+
+    @app.post("/api/admin/setup")
+    def complete_admin_setup(payload: AdminSetupRequest, request: Request):
+        peer = require_loopback_peer(request)
+        if payload.password != payload.password_confirmation:
+            raise HTTPException(status_code=422, detail="password_confirmation_mismatch")
+        try:
+            auth_store.complete_setup(payload.bootstrap_credential, payload.password)
+            token, ttl = auth_store.login(payload.password, peer)
+            return set_admin_cookie(request, token, ttl)
+        except AdminAuthError as exc:
+            code = str(exc)
+            status = 409 if code == "admin_setup_already_complete" else 401 if code.startswith("bootstrap_") else 422
+            raise HTTPException(status_code=status, detail=code) from exc
+
+    @app.post("/api/admin/password-reset")
+    def reset_admin_password(payload: AdminRecoveryRequest, request: Request):
+        peer = require_loopback_peer(request)
+        if payload.password != payload.password_confirmation:
+            raise HTTPException(status_code=422, detail="password_confirmation_mismatch")
+        try:
+            auth_store.reset_password(payload.recovery_credential, payload.password)
+            token, ttl = auth_store.login(payload.password, peer)
+            return set_admin_cookie(request, token, ttl)
+        except AdminAuthError as exc:
+            code = str(exc)
+            status = 401 if code.startswith("recovery_") else 422
+            raise HTTPException(status_code=status, detail=code) from exc
+        return "bearer"
+
+    @app.post("/api/admin/session")
+    def create_admin_session(payload: AdminSessionRequest, request: Request):
+        if bool(payload.password) == bool(payload.admin_token):
+            raise HTTPException(status_code=422, detail="provide_exactly_one_admin_credential")
+        peer = (request.client.host if request.client else "unknown").casefold()
+        loopback = peer in {"127.0.0.1", "::1", "localhost", "testclient"}
+        origin = request.headers.get("origin")
+        if origin and origin not in origins:
+            raise HTTPException(status_code=403, detail="admin_origin_not_allowed")
+        if request.url.scheme != "https" and not loopback:
+            raise HTTPException(status_code=403, detail="admin_session_requires_https")
+        now = time.monotonic()
+        key = peer
+        with login_lock:
+            recent = [stamp for stamp in login_attempts.get(key, []) if now - stamp < 60]
+            if len(recent) >= 5:
+                raise HTTPException(status_code=429, detail="admin_login_rate_limited")
+            recent.append(now)
+            login_attempts[key] = recent
+        if payload.password:
+            try:
+                token, ttl = auth_store.login(payload.password, peer)
+                return set_admin_cookie(request, token, ttl)
+            except AdminAuthError as exc:
+                code = str(exc)
+                status = 429 if code == "admin_login_rate_limited" else 503 if code == "admin_setup_required" else 401
+                raise HTTPException(status_code=status, detail=code) from exc
+        configured = os.getenv("AI_CODE_REVIEWER_ADMIN_TOKEN")
+        if payload.admin_token and configured and len(configured) >= 32 and hmac.compare_digest(payload.admin_token, configured):
+            # Time-limited compatibility path during migration only.
+            token, ttl = auth_store.create_session()
+            return set_admin_cookie(request, token, ttl)
+        raise HTTPException(status_code=401, detail="provider_settings_unauthorized")
+
+    @app.get("/api/admin/session")
+    def get_admin_session(request: Request):
+        authenticated = auth_store.valid_session(request.cookies.get("acr_admin_session"))
+        configured = os.getenv("AI_CODE_REVIEWER_ADMIN_TOKEN")
+        return {"authenticated": authenticated, "expires_in_seconds": SESSION_TTL_SECONDS if authenticated else 0,
+                "setup_required": not auth_store.setup_complete(),
+                "legacy_token_available": bool(configured and len(configured) >= 32)}
+
+    @app.delete("/api/admin/session")
+    def delete_admin_session(request: Request):
+        if request.cookies.get("acr_admin_session") and request.headers.get("origin") not in origins:
+            raise HTTPException(status_code=403, detail="admin_origin_not_allowed")
+        auth_store.revoke_session(request.cookies.get("acr_admin_session"))
+        result = JSONResponse({"authenticated": False})
+        result.delete_cookie("acr_admin_session", path="/api/admin", httponly=True,
+                             secure=request.url.scheme == "https", samesite="strict")
+        return result
+
+    @app.get("/api/admin/provider-settings")
+    def get_provider_settings(request: Request):
+        require_admin(request)
+        from llm.provider_settings import PROVIDER_SETTINGS
+
+        return PROVIDER_SETTINGS.public_snapshot()
+
+    @app.put("/api/admin/provider-settings")
+    def update_provider_settings(settings: ProviderSettingsRequest, request: Request):
+        require_admin(request)
+        from llm.provider_settings import PROVIDER_SETTINGS, ProviderSettingsError
+
+        try:
+            snapshot = PROVIDER_SETTINGS.update(settings.model_dump(exclude_unset=True))
+            from llm.provider_factory import invalidate_provider_cache
+
+            invalidate_provider_cache()
+            return snapshot
+        except ProviderSettingsError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/admin/provider-options")
+    def provider_options(request: Request):
+        require_admin(request)
+        from llm.groq_client import DEFAULT_MODEL, STRICT_STRUCTURED_OUTPUT_MODELS
+        from llm.qwen_peft import DEFAULT_ADAPTER_DIR, DEFAULT_BASE_MODEL_ID
+        from llm.provider_settings import PROVIDER_SETTINGS
+        return {
+            "groq_models": sorted(STRICT_STRUCTURED_OUTPUT_MODELS),
+            "groq_model_source": "server_approved_structured_output_models",
+            "qwen_base_model": DEFAULT_BASE_MODEL_ID,
+            "qwen_adapter_path": PROVIDER_SETTINGS.public_snapshot()["qwen_adapter_path"] or str(DEFAULT_ADAPTER_DIR),
+            "qwen_quantization": ["none"],
+            "review_providers": ["groq", "qwen_local"],
+            "fix_providers": ["groq", "qwen_local"],
+            "default_groq_model": DEFAULT_MODEL,
+        }
+
+    @app.post("/api/admin/provider-connectivity")
+    def provider_connectivity(request: Request):
+        require_admin(request)
+        from llm.provider_settings import PROVIDER_SETTINGS
+        settings = PROVIDER_SETTINGS.task_snapshot("review")
+        if settings["review_provider"] == "groq" or settings["fix_provider"] == "groq":
+            if not settings.get("api_key"):
+                groq_result = {"status": "failed", "message": "Groq API key is not configured."}
+                snapshot = PROVIDER_SETTINGS.public_snapshot()
+                return {"groq": groq_result,
+                        "qwen": {"status": "passed" if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "failed",
+                                 "message": "Approved adapter artifacts are present; weights were not loaded." if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "Approved adapter artifacts are missing."}}
+            try:
+                from groq import Groq
+                response = Groq(api_key=settings["api_key"], max_retries=0, timeout=10).models.list()
+                available = {item.id for item in getattr(response, "data", []) if isinstance(getattr(item, "id", None), str)}
+                from llm.groq_client import STRICT_STRUCTURED_OUTPUT_MODELS
+                approved = sorted(available.intersection(STRICT_STRUCTURED_OUTPUT_MODELS))
+                selected_available = settings["groq_model"] in approved
+                snapshot = PROVIDER_SETTINGS.public_snapshot()
+                return {"groq": {"status": "passed" if selected_available else "failed",
+                                 "message": "Groq account reachable; selected approved structured-output model is available." if selected_available else "Groq account reachable, but the selected approved structured-output model was not listed.",
+                                 "available_approved_models": approved},
+                        "qwen": {"status": "passed" if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "failed",
+                                 "message": "Approved adapter artifacts are present; weights were not loaded." if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "Approved adapter artifacts are missing."}}
+            except Exception:
+                snapshot = PROVIDER_SETTINGS.public_snapshot()
+                return {"groq": {"status": "failed", "message": "Groq connectivity check failed. Check the server key and network."},
+                        "qwen": {"status": "passed" if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "failed",
+                                 "message": "Approved adapter artifacts are present; weights were not loaded." if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "Approved adapter artifacts are missing."}}
+        from llm.provider_settings import PROVIDER_SETTINGS
+        snapshot = PROVIDER_SETTINGS.public_snapshot()
+        return {"groq": {"status": "not_checked", "message": "Groq is not selected."},
+                "qwen": {"status": "passed" if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "failed",
+                         "message": "Approved Qwen adapter artifacts are present; model weights were not loaded." if snapshot["qwen_readiness"] == "artifacts_present_not_loaded" else "Approved Qwen adapter artifacts are missing."}}
+
+    @app.get("/api/admin/github/status")
+    def get_github_status(request: Request):
+        require_admin(request)
+        return credential_store.status()
+
+    @app.put("/api/admin/github/credentials")
+    def set_github_credential(payload: GitHubCredentialRequest, request: Request):
+        require_admin(request)
+        try:
+            storage = credential_store.set(payload.credential_type, payload.value, persistent=payload.persistent)
+            auth_store.record_audit("github_credential_updated", {
+                "credential_type": payload.credential_type, "storage": storage,
+            })
+            if payload.credential_type == "webhook_secret":
+                processor.start()
+            return {"updated": True, "credential_type": payload.credential_type,
+                    "storage": storage, **credential_store.status()}
+        except CredentialStoreError as exc:
+            raise HTTPException(status_code=503 if "unavailable" in str(exc) else 422,
+                                detail=str(exc)) from exc
+
+    @app.delete("/api/admin/github/credentials/{credential_type}")
+    def remove_github_credential(credential_type: str, request: Request):
+        require_admin(request)
+        try:
+            result = credential_store.remove(credential_type)
+            auth_store.record_audit("github_credential_removed", {"credential_type": credential_type})
+            if credential_type == "webhook_secret":
+                processor.stop()
+            return {"removed": result == "removed", **credential_store.status()}
+        except CredentialStoreError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/admin/github/test")
+    def test_github_connection(request: Request):
+        require_admin(request)
+        try:
+            token = credential_store.get("github_token")
+        except CredentialStoreError as exc:
+            raise HTTPException(status_code=503, detail="github_credential_store_unavailable") from exc
+        if not token:
+            return {"status": "failed", "error_code": "github_token_not_configured",
+                    "message": "Configure a GitHub read token before testing the connection."}
+        client = GitHubRESTClient(token=token)
+        try:
+            account = client.get_authenticated_user()
+            return {"status": "passed", "account": account}
+        except GitHubPRException as exc:
+            return {"status": "failed", "error_code": exc.code, "message": exc.message}
+
+    @app.get("/api/admin/github/repositories")
+    def list_github_repositories(request: Request):
+        require_admin(request)
+        try:
+            token = credential_store.get("github_token")
+        except CredentialStoreError as exc:
+            raise HTTPException(status_code=503, detail="github_credential_store_unavailable") from exc
+        if not token:
+            raise HTTPException(status_code=409, detail="github_token_not_configured")
+        client = GitHubRESTClient(token=token)
+        try:
+            repositories = client.list_accessible_repositories()
+            configs = __import__("mcp_server.github_policy", fromlist=["load_repository_action_config"]).load_repository_action_config()
+            return {"repositories": [{**repo,
+                    "policy_configured": repo["full_name"].casefold() in configs,
+                    "policy": _policy_config_payload(configs.get(repo["full_name"].casefold()))}
+                    for repo in repositories]}
+        except GitHubPRException as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+
+    @app.get("/api/admin/github/repositories/{owner}/{repository}/policy")
+    def get_repository_policy(owner: str, repository: str, request: Request):
+        require_admin(request)
+        identity = _validate_repository_identity(owner, repository)
+        from mcp_server.github_policy import read_policy_document, _parse_repository_config
+        try:
+            document, revision = read_policy_document()
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        config = _policy_config_payload(_parse_repository_config(document["repositories"].get(identity.casefold(), {})))
+        return {"repository": identity, "revision": revision, "policy": config,
+                "autonomous_commits": "unavailable_disabled_hard_gate"}
+
+    @app.put("/api/admin/github/repositories/{owner}/{repository}/policy")
+    def update_repository_policy(owner: str, repository: str, payload: RepositoryPolicyRequest,
+                                 request: Request):
+        require_admin(request)
+        identity = _validate_repository_identity(owner, repository)
+        try:
+            token = credential_store.get("github_token")
+        except CredentialStoreError as exc:
+            raise HTTPException(status_code=503, detail="github_credential_store_unavailable") from exc
+        if not token:
+            raise HTTPException(status_code=409, detail="github_token_not_configured")
+        github = GitHubRESTClient(token=token)
+        try:
+            github.get_repository(owner, repository)
+        except GitHubPRException as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+        from mcp_server.github_policy import load_repository_action_config, update_policy_repository
+        values = payload.model_dump(exclude={"revision"})
+        try:
+            _document, revision = update_policy_repository(identity, values, expected_revision=payload.revision)
+            action_coordinator.configs = load_repository_action_config()
+            auth_store.record_audit("github_repository_policy_updated", {
+                "repository": identity.casefold(), "policy_revision": revision,
+                "allow_source_sharing": payload.allow_source_sharing,
+                "publish_review_comments": payload.publish_review_comments,
+            })
+            return {"repository": identity, "revision": revision, "policy": values,
+                    "autonomous_commits": "unavailable_disabled_hard_gate"}
+        except ValueError as exc:
+            code = str(exc)
+            raise HTTPException(status_code=409 if code.endswith("conflict") else 422, detail=code) from exc
+
+    @app.delete("/api/admin/github/repositories/{owner}/{repository}/policy")
+    def delete_repository_policy(owner: str, repository: str, revision: str, request: Request):
+        require_admin(request)
+        identity = _validate_repository_identity(owner, repository)
+        try:
+            token = credential_store.get("github_token")
+            if not token:
+                raise HTTPException(status_code=409, detail="github_token_not_configured")
+            GitHubRESTClient(token=token).get_repository(owner, repository)
+        except GitHubPRException as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+        except CredentialStoreError as exc:
+            raise HTTPException(status_code=503, detail="github_credential_store_unavailable") from exc
+        from mcp_server.github_policy import load_repository_action_config, update_policy_repository
+        try:
+            _document, new_revision = update_policy_repository(identity, {}, expected_revision=revision, delete=True)
+            action_coordinator.configs = load_repository_action_config()
+            auth_store.record_audit("github_repository_policy_removed", {"repository": identity.casefold()})
+            return {"repository": identity, "revision": new_revision, "removed": True}
+        except ValueError as exc:
+            code = str(exc)
+            raise HTTPException(status_code=409 if code.endswith("conflict") else 422, detail=code) from exc
+
+    @app.get("/api/admin/github/webhook")
+    def get_webhook_settings(request: Request):
+        require_admin(request)
+        from urllib.parse import urlsplit
+        endpoint = os.getenv("GITHUB_WEBHOOK_PUBLIC_URL")
+        if not endpoint:
+            base = os.getenv("AI_CODE_REVIEWER_API_URL", "http://127.0.0.1:8000").rstrip("/")
+            endpoint = base + "/api/github/webhook"
+        host = (urlsplit(endpoint).hostname or "").casefold()
+        localhost = host in {"127.0.0.1", "::1", "localhost"}
+        try:
+            recent = delivery_store.list_recent(limit=20)
+        except Exception:
+            recent = []
+        last_authenticated = recent[0] if recent else None
+        last_successful = next((item for item in recent if item.get("status") in {"completed", "partial"}), None)
+        try:
+            secret_status = bool(credential_store.get("webhook_secret"))
+        except CredentialStoreError:
+            secret_status = None
+        reachability = ("localhost_only" if localhost else
+                        "reachable_signed_delivery_received" if last_authenticated else "not_verified")
+        return {"endpoint_url": endpoint, "secret_configured": secret_status,
+                "required_events": ["pull_request"],
+                "public_reachability": reachability,
+                "last_authenticated_delivery": last_authenticated,
+                "last_successful_delivery": last_successful,
+                "recent_deliveries": recent,
+                "delivery_authentication": "HMAC SHA-256 signature required"}
+
+    @app.get("/api/admin/audit")
+    def get_admin_audit(request: Request):
+        require_admin(request)
+        return {"events": auth_store.audit_events(100)}
+
+    @app.get("/api/health")
+    def health():
+        from llm.provider_settings import PROVIDER_SETTINGS
+
+        settings = PROVIDER_SETTINGS.public_snapshot()
+        return {
+            "status": "ready",
+            "provider": settings["review_provider"],
+            "fix_provider": settings["fix_provider"],
+            "provider_initialized": lifecycle.provider_initialized,
+            "state": "in_memory_process_local",
+            "github_token_configured": bool(os.getenv("GITHUB_TOKEN")),
+        }
+
+    @app.get("/api/verification/capabilities")
+    def verification_capabilities():
+        return {
+            "syntax": "available_ast_parse_only",
+            "static": "available_deterministic_ast_rules",
+            "behavioral": "not_run_isolated_execution_broker_unavailable",
+            "github_ci": "read_only_exact_sha_verification_available",
+            "candidate_revision_ci": "requires_candidate_revision",
+            "commit_execution": "disabled",
+        }
+
+    @app.post("/api/github/pr-reviews", status_code=200)
+    def review_github_pr(request: GitHubPRReviewRequest):
+        if not _PR_REVIEW_SLOT.acquire(blocking=False):
+            raise HTTPException(status_code=429, detail="github_pr_review_busy")
+        try:
+            _apply_github_credentials(lifecycle, credential_store, action_coordinator)
+            from mcp_server.github_policy import load_repository_action_config
+            action_coordinator.configs = load_repository_action_config()
+            result = lifecycle.review_github_pr(request.url)
+            payload = result.to_dict()
+            payload["action_policy"] = action_coordinator.describe_repository(result.repository)
+            from llm.provider_settings import PROVIDER_SETTINGS
+            if result.provider_identity and result.provider_identity.startswith("groq:"):
+                payload["action_policy"]["source_sharing_authorization"] = (
+                    "authorized" if PROVIDER_SETTINGS.public_snapshot()["source_sharing_consent"]
+                    and payload["action_policy"]["repository_source_sharing"] == "allowed"
+                    else "not_authorized")
+            else:
+                payload["action_policy"]["source_sharing_authorization"] = "local_provider_no_external_sharing"
+            return payload
+        except GitHubPRException as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code)
+        except Exception as exc:
+            from llm.provider_settings import ProviderSettingsError
+
+            if isinstance(exc, ProviderSettingsError) and str(exc) == "source_sharing_not_authorized":
+                raise HTTPException(status_code=403, detail="source_sharing_not_authorized") from exc
+            raise HTTPException(status_code=503, detail="github_pr_review_unavailable") from exc
+        finally:
+            _PR_REVIEW_SLOT.release()
+
+    @app.post("/api/github/webhook", status_code=202)
+    async def github_webhook(request: Request):
+        try:
+            secret = credential_store.get("webhook_secret")
+        except CredentialStoreError as exc:
+            raise HTTPException(status_code=503, detail="webhook_credential_store_unavailable") from exc
+        if not secret:
+            raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
+        limit = _webhook_body_limit()
+        raw_body = await _read_bounded_body(request, limit)
+        if not verify_signature(raw_body, request.headers.get("x-hub-signature-256"), secret):
+            raise HTTPException(status_code=401, detail="invalid_webhook_signature")
+        try:
+            delivery = parse_delivery(
+                raw_body,
+                delivery_id=request.headers.get("x-github-delivery", ""),
+                event=request.headers.get("x-github-event", ""),
+            )
+            # Some ASGI test/development clients invoke requests without a
+            # lifespan manager; starting is idempotent and happens only after
+            # authentication and payload validation.
+            processor.start()
+            disposition, record = processor.accept(delivery)
+        except WebhookError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code)
+        except Exception:
+            raise HTTPException(status_code=503, detail="webhook_intake_unavailable")
+        status = record.get("status", "pending")
+        return {
+            "delivery_id": delivery.delivery_id,
+            "status": status,
+            "duplicate": disposition == "duplicate",
+            "failure_code": record.get("failure_code"),
+        }
+
+    @app.get("/api/github/webhook/deliveries/{delivery_id}")
+    def get_webhook_delivery(delivery_id: str, request: Request):
+        try:
+            authorized = verify_status_token(
+                request.headers.get("authorization"), os.getenv("GITHUB_WEBHOOK_STATUS_TOKEN")
+            )
+        except WebhookError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code)
+        if not authorized:
+            raise HTTPException(status_code=401, detail="webhook_status_unauthorized")
+        if not credential_store.get("webhook_secret"):
+            raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
+        processor.start()
+        record = processor.store.get(delivery_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="webhook_delivery_not_found")
+        return record
+
+    @app.get("/api/github/webhook/deliveries/{delivery_id}/actions")
+    def get_webhook_actions(delivery_id: str, request: Request):
+        try:
+            authorized = verify_status_token(
+                request.headers.get("authorization"), os.getenv("GITHUB_WEBHOOK_STATUS_TOKEN")
+            )
+        except WebhookError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code)
+        if not authorized:
+            raise HTTPException(status_code=401, detail="webhook_status_unauthorized")
+        if not credential_store.get("webhook_secret"):
+            raise HTTPException(status_code=503, detail="webhook_secret_not_configured")
+        processor.start()
+        record = processor.store.get(delivery_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="webhook_delivery_not_found")
+        return {"delivery_id": delivery_id, "status": record["status"],
+                "repository": record["owner"] + "/" + record["repository"],
+                "pr_number": record["pr_number"], "base_sha": record["base_sha"],
+                "head_sha": record["head_sha"], "failure_code": record.get("failure_code"),
+                "actions": record["actions"]}
+
+    @app.post("/api/github/webhook/deliveries/{delivery_id}/actions/{action_id}/reconcile")
+    def reconcile_webhook_action(delivery_id: str, action_id: str, request: Request):
+        try:
+            authorized = verify_status_token(
+                request.headers.get("authorization"), os.getenv("GITHUB_WEBHOOK_STATUS_TOKEN")
+            )
+        except WebhookError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.code)
+        if not authorized:
+            raise HTTPException(status_code=401, detail="webhook_status_unauthorized")
+        record = processor.store.get(delivery_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail="webhook_delivery_not_found")
+        action = next((item for item in record["actions"] if item["action_id"] == action_id), None)
+        if action is None:
+            raise HTTPException(status_code=404, detail="webhook_action_not_found")
+        if action.get("action_type") != "review_comment" or action.get("publication_status") not in {
+                "unknown", "requires_reconciliation"}:
+            raise HTTPException(status_code=409, detail="action_does_not_require_reconciliation")
+        owner, separator, repository = str(action.get("repository", "")).partition("/")
+        if not separator:
+            raise HTTPException(status_code=409, detail="action_repository_identity_invalid")
+        from mcp_server.github_pr import PullRequestRef
+
+        result = action_coordinator.adapter.reconcile_inline_comment(
+            PullRequestRef(owner, repository, int(action["pr_number"])),
+            repository=action["repository"], expected_head_sha=action["head_sha"],
+            operation_id=action.get("operation_id") or action_id,
+        )
+        if result.get("status") == "published":
+            processor.store.mark_reconciled(action_id, status="published",
+                                            github_comment_id=result.get("github_comment_id"))
+        elif result.get("status") == "not_published":
+            processor.store.mark_reconciled(action_id, status="failed",
+                                            failure_code="reconciled_comment_absent_retry_requires_operator")
+        elif result.get("status") == "stale":
+            processor.store.mark_reconciled(action_id, status="stale",
+                                            failure_code="reconciled_expected_revision_changed")
+        return {"action_id": action_id, **result}
+
+    @app.post("/api/reviews", status_code=201)
+    def submit_review(request: ReviewRequest):
+        try:
+            review_id, review, timings = lifecycle.submit_review_with_timings(request.code)
+        except OverflowError:
+            raise HTTPException(status_code=413, detail="code_too_large")
+        except ValueError as exc:
+            if str(exc) == "source_sharing_not_authorized":
+                raise HTTPException(status_code=403, detail="source_sharing_not_authorized") from exc
+            raise HTTPException(status_code=422, detail=str(exc))
+        except Exception as exc:
+            from llm.provider_settings import ProviderSettingsError
+
+            if isinstance(exc, ProviderSettingsError) and str(exc) == "source_sharing_not_authorized":
+                raise HTTPException(status_code=403, detail="source_sharing_not_authorized") from exc
+            raise HTTPException(status_code=503, detail="review_provider_unavailable") from exc
+        if not review.valid:
+            raise HTTPException(status_code=502, detail="review_provider_or_validation_failed")
+        return {"review_id": review_id, "review": _review_payload(review), "timings": timings,
+                "provider_identity": lifecycle.provider_identity("review")}
+
+    @app.get("/api/reviews/{review_id}")
+    def get_review(review_id: str):
+        handle = lifecycle.get_review(review_id)
+        if handle is None:
+            raise HTTPException(status_code=404, detail="review_not_found_or_expired")
+        return {"review_id": review_id, "review": _review_payload(handle.response)}
+
+    @app.post("/api/reviews/{review_id}/findings/{finding_id}/fixes", status_code=201)
+    def generate_fix(review_id: str, finding_id: str, request: FixRequest = FixRequest()):
+        try:
+            candidate = lifecycle.generate_fix(review_id, finding_id, request.language)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="review_not_found_or_expired")
+        except Exception as exc:
+            from llm.provider_settings import ProviderSettingsError
+
+            if isinstance(exc, ProviderSettingsError) and str(exc) == "source_sharing_not_authorized":
+                raise HTTPException(status_code=403, detail="source_sharing_not_authorized") from exc
+            raise HTTPException(status_code=503, detail="fix_provider_unavailable") from exc
+        if candidate.generation_status != "generated":
+            if any(error.startswith("fix_generation_failed") for error in candidate.generation_errors):
+                raise HTTPException(status_code=503, detail="fix_provider_unavailable")
+            error = candidate.generation_errors[0] if candidate.generation_errors else ""
+            if error.startswith("finding_not_found"):
+                raise HTTPException(status_code=404, detail="finding_not_found")
+            if error.startswith("finding_abstained"):
+                raise HTTPException(status_code=409, detail="finding_abstained")
+            if error.startswith("invalid_review_response"):
+                raise HTTPException(status_code=409, detail="review_handle_invalid")
+            # The request passed FastAPI validation; a rejected generated
+            # candidate is an upstream response failure, not a client 422.
+            raise HTTPException(status_code=502, detail="fix_provider_response_invalid")
+        return _candidate_payload(candidate)
+
+    @app.get("/api/fixes/{candidate_id}")
+    def get_fix(candidate_id: str):
+        candidate = lifecycle.get_candidate(candidate_id)
+        if candidate is None:
+            raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
+        return _candidate_payload(candidate)
+
+    @app.post("/api/fixes/{candidate_id}/verify")
+    def verify_fix(candidate_id: str):
+        try:
+            return lifecycle.verify(candidate_id).to_dict()
+        except LookupError:
+            raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
+
+    @app.post("/api/fixes/{candidate_id}/accept")
+    def accept_fix(candidate_id: str):
+        try:
+            return lifecycle.accept(candidate_id).to_dict()
+        except LookupError:
+            raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
+
+    @app.post("/api/fixes/{candidate_id}/reject")
+    def reject_fix(candidate_id: str):
+        try:
+            return lifecycle.reject(candidate_id).to_dict()
+        except LookupError:
+            raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
+
+    @app.get("/api/fixes/{candidate_id}/export")
+    def export_fix(candidate_id: str):
+        try:
+            return lifecycle.export(candidate_id).to_dict()
+        except LookupError:
+            raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
+        except ValueError:
+            raise HTTPException(status_code=409, detail="candidate_not_accepted_or_unverified")
+
+    return app
+
+
+def _print_startup_summary(auth_store: AdminAuthStore, credentials: CredentialStore,
+                           bootstrap_credential: Optional[str]) -> None:
+    from urllib.parse import urlsplit, urlunsplit
+    from llm.provider_settings import PROVIDER_SETTINGS
+
+    def safe_base(value: str) -> str:
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return "(invalid URL configuration)"
+            host = parsed.hostname
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            return urlunsplit((parsed.scheme, host, parsed.path.rstrip("/"), "", ""))
+        except ValueError:
+            return "(invalid URL configuration)"
+
+    api_url = safe_base(os.getenv("AI_CODE_REVIEWER_API_URL", "http://127.0.0.1:8000"))
+    frontend_url = safe_base(os.getenv("AI_CODE_REVIEWER_FRONTEND_URL", "http://127.0.0.1:5173"))
+    setup = auth_store.setup_complete()
+    provider_status = PROVIDER_SETTINGS.public_snapshot()
+    github_status = credentials.status()
+    print("\nAI Code Reviewer — Backend Started")
+    print(f"API: {api_url}")
+    print(f"Frontend: {frontend_url}")
+    print(f"Admin Login: {frontend_url}/settings")
+    print(f"Authentication: {'Configured' if setup else 'Setup required'}")
+    print("Recovery: python -m mcp_server.admin_cli reset-password")
+    if bootstrap_credential:
+        print(f"Admin Setup: {frontend_url}/setup")
+        print(f"One-time bootstrap credential (expires in 30 minutes): {bootstrap_credential}")
+    elif not setup:
+        print("Setup credential was previously issued or expired; run python -m mcp_server.admin_cli reset-bootstrap locally.")
+    print(f"Groq: {'Configured' if provider_status['groq_api_key_configured'] else 'Not configured'}")
+    github_configured = github_status["github_token_configured"]
+    github_label = "Configured" if github_configured is True else "Not configured" if github_configured is False else "Status unavailable"
+    print(f"GitHub: {github_label}")
+    print()
+
+
+def _validate_repository_identity(owner: str, repository: str) -> str:
+    import re
+    if (not isinstance(owner, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", owner)
+            or not isinstance(repository, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repository)
+            or owner in {".", ".."} or repository in {".", ".."}):
+        raise HTTPException(status_code=422, detail="repository_identity_invalid")
+    return f"{owner}/{repository}"
+
+
+def _policy_config_payload(config) -> dict:
+    from mcp_server.github_policy import RepositoryActionConfig
+    values = asdict(config or RepositoryActionConfig())
+    return {key: list(value) if isinstance(value, tuple) else value for key, value in values.items()}
+
+
+def _apply_github_credentials(lifecycle: ReviewFixService, credentials: CredentialStore,
+                              action_coordinator: GitHubActionCoordinator, *, include_action: bool = False) -> None:
+    client = getattr(getattr(lifecycle, "github_pr_service", None), "client", None)
+    try:
+        if isinstance(client, GitHubRESTClient):
+            client.token = credentials.get("github_token")
+        adapter = getattr(action_coordinator, "adapter", None)
+        if include_action and adapter is not None:
+            adapter.token = credentials.get("github_actions_token")
+    except CredentialStoreError as exc:
+        raise HTTPException(status_code=503, detail="github_credential_store_unavailable") from exc
+
+
+app = create_app()
+
+
+def _webhook_body_limit() -> int:
+    try:
+        value = int(os.getenv("GITHUB_WEBHOOK_MAX_BODY_BYTES", str(DEFAULT_WEBHOOK_BODY_LIMIT)))
+    except ValueError:
+        value = DEFAULT_WEBHOOK_BODY_LIMIT
+    return min(max(value, 1024), 4 * 1024 * 1024)
+
+
+async def _read_bounded_body(request: Request, limit: int) -> bytes:
+    length = request.headers.get("content-length")
+    if length is not None:
+        try:
+            if int(length) < 0:
+                raise ValueError
+            if int(length) > limit:
+                raise HTTPException(status_code=413, detail="webhook_body_too_large")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid_content_length") from exc
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(status_code=413, detail="webhook_body_too_large")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _run_webhook_review(lifecycle: ReviewFixService, event: dict,
+                        action_coordinator: Optional[GitHubActionCoordinator] = None):
+    # Values are validated identifiers, never payload-supplied URLs.
+    url = f"https://github.com/{event['owner']}/{event['repository']}/pull/{event['number']}"
+    result = lifecycle.review_github_pr(
+        url,
+        expected_owner=event["owner"],
+        expected_repository=event["repository"],
+        expected_number=event["number"],
+        expected_base_sha=event["base_sha"],
+        expected_head_sha=event["head_sha"],
+    )
+    payload = result.to_dict()
+    payload["provider_identity"] = lifecycle.provider_identity("review")
+    if action_coordinator is not None:
+        payload["action_processing"] = action_coordinator.process_review(event, payload)
+    return payload

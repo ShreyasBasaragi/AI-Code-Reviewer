@@ -1,44 +1,42 @@
 import os
 import sys
+import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from fastmcp import FastMCP
 
-from rag.retrieve import retrieve_context, retrieve_context_for_repository
-from mcp_server.notifier import notify_user_if_issue, parse_review_verdict
+from mcp_server.orchestrator import (
+    accept_fix as accept_fix_candidate,
+    export_fix as export_fix_candidate,
+    generate_fix_candidate,
+    reject_fix as reject_fix_candidate,
+    run_review_pipeline,
+    verify_fix_candidate,
+)
+from fix_generation import failed_fix_candidate
+from fix_verification import FixVerificationResult, SyntaxCheckResult
+from fix_lifecycle import record_verification
+from mcp_server.state import PROCESS_STATE
+from mcp_server.github_webhook import WebhookDeliveryStore
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("critique-mcp")
+
+# Process-local handles let an explicit follow-up MCP call use the exact reviewed
+# code and evidence without writing review payloads to disk. Keep only recent items.
+_REVIEW_CACHE = PROCESS_STATE.reviews
+_REVIEW_CACHE_LIMIT = PROCESS_STATE.limit
+_FIX_CANDIDATE_CACHE = PROCESS_STATE.candidates
+_FIX_CANDIDATE_CACHE_LIMIT = PROCESS_STATE.limit
 
 # Initialize FastMCP Server
 mcp = FastMCP(
     name="Critique AI Code Reviewer",
     instructions="Autonomous AI Code Review Server with RAG Knowledge Retrieval and Desktop Alerts"
 )
-
-# Global LLM instance (lazy initialized)
-_llm_instance = None
-
-
-def get_llm():
-    """Lazy initialize the fine-tuned Qwen LLM instance."""
-    global _llm_instance
-    if _llm_instance is None:
-        try:
-            from llm.qwen_client import QwenLLM
-            logger.info("Initializing fine-tuned Qwen 2.5 Coder LLM...")
-            _llm_instance = QwenLLM()
-        except Exception as e:
-            logger.warning(f"Could not load local Qwen model: {e}. Falling back to GroqLLM if configured.")
-            try:
-                from llm.groq_client import GroqLLM
-                _llm_instance = GroqLLM()
-            except Exception as ge:
-                raise RuntimeError(f"Failed to load any LLM backend (Qwen: {e}, Groq: {ge})") from e
-    return _llm_instance
-
 
 @mcp.tool()
 def review_code(code: str, file_path: str = "", repository: str = "") -> str:
@@ -49,29 +47,29 @@ def review_code(code: str, file_path: str = "", repository: str = "") -> str:
     Args:
         code: Source code string to review.
         file_path: Optional file path or module name for context.
-        repository: Optional repository name (e.g. 'psf/requests') for tailored RAG retrieval.
+        repository: Retained for caller compatibility; repository-filtered retrieval is not implemented.
 
     Returns:
-        Structured code review findings including severity, issue type, evidence, and fix.
+        JSON review response containing validated findings and source evidence references.
     """
     if not code or not code.strip():
         return "Error: Code snippet is empty."
 
     logger.info(f"Received review request for: {file_path or 'unnamed snippet'}")
 
-    # 1. Retrieve RAG context from ChromaDB
-    repo_param = repository.strip() if repository else None
-    context = retrieve_context_for_repository(code=code, repository=repo_param, k=5)
-    logger.info(f"Retrieved {len(context)} RAG context snippets.")
-
-    # 2. Run LLM Inference
-    llm = get_llm()
-    review = llm.analyze_code(code=code, context=context)
-
-    # 3. Trigger Desktop Toast Alert if an issue was found
-    notify_user_if_issue(review, file_path=file_path)
-
-    return review
+    # Keep MCP requests on the same injectable pipeline used by the PR orchestrator.
+    # The repository argument remains accepted for compatibility; retrieval currently
+    # uses the existing code-only interface and does not filter by repository.
+    result = run_review_pipeline(
+        code=code,
+        file_path=file_path or "unknown_file.py",
+    )
+    payload = result.review_response.to_dict()
+    if result.review_response.valid:
+        review_id = uuid.uuid4().hex
+        PROCESS_STATE.put_review(review_id, code, result.review_response)
+        payload["review_id"] = review_id
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -107,6 +105,108 @@ def review_diff(diff: str, repository: str = "") -> str:
     return review_code(code=diff, file_path="PR Diff", repository=repository)
 
 
+@mcp.tool()
+def generate_fix(review_id: str, finding_ref: str, language: str = "python") -> str:
+    """Generate an unapplied, unverified Python fix for one finding from a prior review."""
+    handle = PROCESS_STATE.get_review(review_id)
+    if handle is None:
+        candidate = failed_fix_candidate(
+            finding_ref=finding_ref,
+            original_code="",
+            error="review_not_found: request_a_valid_review_in_this_server_session",
+        )
+    else:
+        _REVIEW_CACHE.move_to_end(review_id)
+        original_code, review_response = handle.code, handle.response
+        candidate = generate_fix_candidate(
+            review_response=review_response,
+            finding_ref=finding_ref,
+            original_code=original_code,
+            language=language,
+        )
+        if candidate.generation_status == "generated":
+            PROCESS_STATE.put_candidate(candidate)
+    return json.dumps(candidate.to_dict(), ensure_ascii=False)
+
+
+@mcp.tool()
+def verify_fix(candidate_id: str) -> str:
+    """Explicitly diff and statically verify a generated fix; never runs its code."""
+    valid_handle = isinstance(candidate_id, str) and bool(candidate_id)
+    candidate = PROCESS_STATE.get_candidate(candidate_id) if valid_handle else None
+    if candidate is None:
+        report = FixVerificationResult(
+            candidate_id=candidate_id if valid_handle else "",
+            unified_diff="",
+            syntax_check=SyntaxCheckResult(check_name="ast.parse", status="not_run"),
+            verification_status="verification_error",
+            static_analysis_status="errored",
+            static_analysis_errors=({"message": "candidate_not_found: handle_unknown_or_expired"},),
+            verification_errors=("candidate_not_found: handle_unknown_or_expired",),
+        )
+        return json.dumps(report.to_dict(), ensure_ascii=False)
+    report = verify_fix_candidate(candidate, expected_candidate_id=candidate_id)
+    PROCESS_STATE.put_candidate(record_verification(candidate, report))
+    return json.dumps(report.to_dict(), ensure_ascii=False)
+
+
+@mcp.tool()
+def accept_fix(candidate_id: str) -> str:
+    """Explicitly accept a syntax- and statically verified candidate."""
+    candidate = _get_cached_candidate(candidate_id)
+    if candidate is None:
+        return json.dumps(_candidate_handle_error(candidate_id, "accept"), ensure_ascii=False)
+    result = accept_fix_candidate(candidate)
+    PROCESS_STATE.put_candidate(result.candidate)
+    return json.dumps(result.to_dict(), ensure_ascii=False)
+
+
+@mcp.tool()
+def reject_fix(candidate_id: str) -> str:
+    """Explicitly reject a candidate without modifying its source or review."""
+    candidate = _get_cached_candidate(candidate_id)
+    if candidate is None:
+        return json.dumps(_candidate_handle_error(candidate_id, "reject"), ensure_ascii=False)
+    result = reject_fix_candidate(candidate)
+    PROCESS_STATE.put_candidate(result.candidate)
+    return json.dumps(result.to_dict(), ensure_ascii=False)
+
+
+@mcp.tool()
+def export_fix(candidate_id: str) -> str:
+    """Return accepted corrected code and diff as JSON; does not write a file."""
+    candidate = _get_cached_candidate(candidate_id)
+    if candidate is None:
+        return json.dumps(_candidate_handle_error(candidate_id, "export"), ensure_ascii=False)
+    try:
+        payload = export_fix_candidate(candidate).to_dict()
+    except ValueError as exc:
+        payload = {
+            "candidate_id": candidate_id,
+            "error": "export_not_allowed",
+            "message": str(exc),
+            "approval_status": candidate.approval_status,
+            "syntax_verification_status": candidate.verification_status,
+        }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _get_cached_candidate(candidate_id):
+    if not isinstance(candidate_id, str) or not candidate_id:
+        return None
+    return PROCESS_STATE.get_candidate(candidate_id)
+
+
+def _candidate_handle_error(candidate_id, action):
+    return {
+        "candidate_id": candidate_id if isinstance(candidate_id, str) else "",
+        "action": action,
+        "approval_status": "unknown",
+        "outcome": "error",
+        "error": "candidate_not_found: handle_unknown_or_expired",
+    }
+
+
 @mcp.resource("critique://status")
 def get_system_status() -> str:
     """Check Critique server status, active model, and RAG vector store breakdown."""
@@ -126,6 +226,30 @@ def get_system_status() -> str:
         status_lines.append("  (ChromaDB is empty or uninitialized)")
 
     return "\n".join(status_lines)
+
+
+@mcp.tool()
+def get_github_action_records(delivery_id: str, status_token: str) -> str:
+    """Read sanitized, durable action decisions for one webhook delivery.
+
+    This is a read-only MCP tool. GitHub writes are performed only by the
+    policy-gated webhook worker; there are no model-callable write tools.
+    """
+    from mcp_server.github_webhook import verify_status_token, WebhookError
+
+    try:
+        authorized = verify_status_token(
+            "Bearer " + status_token if isinstance(status_token, str) else None,
+            os.getenv("GITHUB_WEBHOOK_STATUS_TOKEN"),
+        )
+    except WebhookError:
+        authorized = False
+    if not authorized:
+        return json.dumps({"error": "webhook_status_unauthorized"})
+    store = WebhookDeliveryStore.from_environment()
+    store.initialize()
+    records = store.get_actions(delivery_id) if isinstance(delivery_id, str) else []
+    return json.dumps({"delivery_id": delivery_id, "actions": records}, ensure_ascii=False)
 
 
 if __name__ == "__main__":

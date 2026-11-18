@@ -79,9 +79,48 @@ rag/data/raw/*.zip
 # MCP Logs
 mcp_server/logs/
 rag/data/chroma_db_v2/
+rag/data/chroma_db_v3/
+rag/data/chroma_db_v3.staging/
+
+# Local fine-tuned model artifacts are provisioned outside version control.
+/adapter/
+/critique_adapter.zip
 
 rag/data/raw/owasp_cheatsheets/
 rag/data/raw/bandit_rules/
 rag/data/raw/cwe/
 rag/data/raw/pep-0008.html
 rag/data/raw/google_pyguide.md
+
+
+# Generated dataset artifacts
+/dataset_pipeline/outputs/
+/dataset_inventory_reports/
+
+# Generated evaluation results
+/evaluation/results/
+
+# Local audit outputs (review before publishing)
+/project_audit/
+
+# Local database and credential files
+*.sqlite
+*.sqlite3
+*.db
+.env
+.env.*
+!.env.example
+
+# Local model artifacts
+/adapter/
+*.safetensors
+*.gguf
+*.pt
+*.pth
+
+
+# Downloaded third-party repositories for RAG
+/rag/data/raw/git_repos/
+
+
+/Critique_RAG_v2_Summary_Report.pdf

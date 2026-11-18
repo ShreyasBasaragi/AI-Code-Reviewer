@@ -1,0 +1,37 @@
+schema_version: "1.0"
+required_envelope_fields:
+  - record_id
+  - source
+  - source_revision
+  - source_checksum
+  - source_file
+  - source_task
+  - source_metadata
+  - source_labels
+  - eligibility
+nullable_fields:
+  - source_record_id
+  - source_ordinal
+  - source_locator
+  - source_split
+  - repository
+  - commit_id
+  - pull_request_id
+  - language
+  - before_code
+  - before_file
+  - after_code
+  - diff
+  - review_comment
+  - defect_status
+  - severity
+  - explanation
+  - fix_recommendation
+  - token_count
+objectives:
+  - defect_detection
+  - severity_classification
+  - explanation_generation
+  - fix_recommendation
+  - review_comment_generation
+  - review_quality_classification

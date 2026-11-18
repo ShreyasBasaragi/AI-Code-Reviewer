@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-code-reviewer-dataset-pipeline"
+version = "0.1.0"
+description = "Portable, source-aware dataset inventory and selection tools"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0"]
+
+[project.optional-dependencies]
+parquet = ["pyarrow>=12.0"]
+tokenizer = ["tokenizers>=0.15"]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+dataset-pipeline = "dataset_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

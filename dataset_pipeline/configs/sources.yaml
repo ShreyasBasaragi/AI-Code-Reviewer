@@ -1,0 +1,22 @@
+project_root: ../..
+source_revision: local-unpinned
+sample_max_bytes_per_file: 4194304
+
+# The full 8,000-row msg-train-selected file is intentionally excluded. It is
+# contained in msg-train.jsonl and is not an independent source.
+microsoft:
+  - {task: Comment_Generation, split: train, path: rag/data/raw/microsoft_codereviewer/Comment_Generation/msg-train.jsonl}
+  - {task: Comment_Generation, split: validation, path: rag/data/raw/microsoft_codereviewer/Comment_Generation/msg-valid.jsonl}
+  - {task: Comment_Generation, split: test, path: rag/data/raw/microsoft_codereviewer/Comment_Generation/msg-test.jsonl}
+  - {task: Code_Refinement, split: train, path: rag/data/raw/microsoft_codereviewer/Code_Refinement/ref-train.jsonl}
+  - {task: Code_Refinement, split: validation, path: rag/data/raw/microsoft_codereviewer/Code_Refinement/ref-valid.jsonl}
+  - {task: Code_Refinement, split: test, path: rag/data/raw/microsoft_codereviewer/Code_Refinement/ref-test.jsonl}
+  - {task: Diff_Quality_Estimation, split: train, path: rag/data/raw/microsoft_codereviewer/Diff_Quality_Estimation/cls-train-chunk-0.jsonl}
+  - {task: Diff_Quality_Estimation, split: train, path: rag/data/raw/microsoft_codereviewer/Diff_Quality_Estimation/cls-train-chunk-1.jsonl}
+  - {task: Diff_Quality_Estimation, split: train, path: rag/data/raw/microsoft_codereviewer/Diff_Quality_Estimation/cls-train-chunk-2.jsonl}
+  - {task: Diff_Quality_Estimation, split: train, path: rag/data/raw/microsoft_codereviewer/Diff_Quality_Estimation/cls-train-chunk-3.jsonl}
+  - {task: Diff_Quality_Estimation, split: validation, path: rag/data/raw/microsoft_codereviewer/Diff_Quality_Estimation/cls-valid.jsonl}
+  - {task: Diff_Quality_Estimation, split: test, path: rag/data/raw/microsoft_codereviewer/Diff_Quality_Estimation/cls-test.jsonl}
+
+devign_candidate:
+  path: rag/data/raw/function.json

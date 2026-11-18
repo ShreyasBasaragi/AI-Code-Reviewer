@@ -1,17 +1,18 @@
 """Read-only retrieval interface for the Critique RAG v2 vector database.
 
 Public Interface Contract:
-    def retrieve_context(code: str) -> list[str]:
+    def retrieve_context(code: str) -> list[str]
 
 Characteristics:
 - Strictly read-only: never modifies the vector store, never triggers ingestion.
 - Never creates collections: uses get_collection(); returns [] if unavailable.
-- Up to 4 relevant context chunks returned, ordered from most to least relevant.
-- Bounded and window-aware query handling for large code snippets.
+- Uses only the configured v2 collection.
+- Up to four relevant evidence records are returned, ordered by relevance.
 """
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional
 
 import chromadb
@@ -23,6 +24,7 @@ from rag.config import (
     DEFAULT_K,
     EMBEDDING_MODEL_NAME,
 )
+from review_schema import RetrievedEvidence
 
 logger = logging.getLogger(__name__)
 
@@ -32,30 +34,22 @@ _embedding_function = None
 
 
 def _get_collection():
-    """
-    Return the existing v2 collection; never create it during retrieval.
-    Returns None gracefully if the database or collection does not exist.
-    """
+    """Return the existing v2 collection without creating or modifying it."""
     global _chroma_client, _collection, _embedding_function
 
     if _collection is not None:
         return _collection
-
     if not CHROMA_PERSIST_DIR.exists():
         logger.warning(
             "ChromaDB persist directory '%s' does not exist. Run 'python -m rag.ingest' first.",
             CHROMA_PERSIST_DIR,
         )
         return None
-
     try:
         _chroma_client = chromadb.PersistentClient(path=str(CHROMA_PERSIST_DIR))
-        _embedding_function = (
-            embedding_functions.SentenceTransformerEmbeddingFunction(
-                model_name=EMBEDDING_MODEL_NAME
-            )
+        _embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name=EMBEDDING_MODEL_NAME
         )
-        # get_collection is strict: raises if collection does not exist.
         _collection = _chroma_client.get_collection(
             name=COLLECTION_NAME,
             embedding_function=_embedding_function,
@@ -63,9 +57,9 @@ def _get_collection():
         return _collection
     except Exception as exc:
         logger.warning(
-            "RAG collection '%s' is unavailable. Run 'python -m rag.ingest' first. Details: %s",
+            "RAG collection '%s' is unavailable. Run 'python -m rag.ingest' first. Error type: %s",
             COLLECTION_NAME,
-            exc,
+            type(exc).__name__,
         )
         return None
 
@@ -79,48 +73,82 @@ def _split_code_windows(code: str, max_chars: int = 800, stride_chars: int = 400
     windows: List[str] = []
     current_chunk = []
     current_len = 0
-
     for line in lines:
         current_chunk.append(line)
         current_len += len(line)
         if current_len >= max_chars:
             windows.append("".join(current_chunk).strip())
-            # Slide by roughly stride_chars
             retain_chars = max(0, current_len - stride_chars)
             new_chunk = []
             new_len = 0
-            for l in reversed(current_chunk):
-                if new_len + len(l) <= retain_chars:
-                    new_chunk.insert(0, l)
-                    new_len += len(l)
+            for current_line in reversed(current_chunk):
+                if new_len + len(current_line) <= retain_chars:
+                    new_chunk.insert(0, current_line)
+                    new_len += len(current_line)
                 else:
                     break
             current_chunk = new_chunk
             current_len = new_len
 
     if current_chunk:
-        rem = "".join(current_chunk).strip()
-        if rem and rem not in windows:
-            windows.append(rem)
-
+        remainder = "".join(current_chunk).strip()
+        if remainder and remainder not in windows:
+            windows.append(remainder)
     return windows if windows else [code.strip()]
 
 
-def retrieve_context(code: str) -> list[str]:
-    """
-    Return up to four most relevant context strings for a code snippet.
+def _evidence_from_query_results(results, query_index: int = 0) -> list[RetrievedEvidence]:
+    """Map Chroma's aligned result arrays to source-aware evidence records."""
+    ids_by_query = results.get("ids") or []
+    docs_by_query = results.get("documents") or []
+    metadata_by_query = results.get("metadatas") or []
+    distances_by_query = results.get("distances") or []
 
-    Requirements:
-    - Exact public interface: def retrieve_context(code: str) -> list[str]:
-    - Most relevant results first.
-    - Up to 4 results returned (DEFAULT_K = 4).
-    - Returns [] for empty or invalid input.
-    - Handles missing database gracefully.
-    - Fully read-only: no collection creation, ingestion, or filesystem mutations.
+    ids = ids_by_query[query_index] if query_index < len(ids_by_query) else []
+    docs = docs_by_query[query_index] if query_index < len(docs_by_query) else []
+    metadatas = metadata_by_query[query_index] if query_index < len(metadata_by_query) else []
+    distances = distances_by_query[query_index] if query_index < len(distances_by_query) else []
+
+    evidence = []
+    for index, text in enumerate(docs):
+        if not isinstance(text, str) or not text.strip():
+            continue
+        metadata = (
+            metadatas[index]
+            if index < len(metadatas) and isinstance(metadatas[index], dict)
+            else {}
+        )
+        record_id = ids[index] if index < len(ids) and isinstance(ids[index], str) else None
+        distance = distances[index] if index < len(distances) else None
+        try:
+            distance = float(distance) if distance is not None else None
+        except (TypeError, ValueError):
+            distance = None
+        rule_identifier = metadata.get("rule_id") or metadata.get("cwe_id") or metadata.get("rule")
+        evidence.append(
+            RetrievedEvidence(
+                evidence_id=record_id,
+                source_family=metadata.get("source"),
+                source_url=metadata.get("source_url"),
+                rule_identifier=str(rule_identifier) if rule_identifier is not None else None,
+                text=text,
+                language=metadata.get("language"),
+                metadata=metadata,
+                distance=distance,
+            )
+        )
+    return evidence
+
+
+def _retrieve_evidence_v2(code: str) -> list[RetrievedEvidence]:
+    """Return structured evidence from the existing v2 collection only.
+
+    This function is read-only, uses the configured collection, and does not create
+    collections or load model weights. Query embeddings are generated by Chroma's
+    configured embedding function when this function is called.
     """
     if not isinstance(code, str) or not code.strip():
         return []
-
     collection = _get_collection()
     if collection is None:
         return []
@@ -132,46 +160,91 @@ def retrieve_context(code: str) -> list[str]:
             return []
 
         clean_code = code.strip()
-
-        # If snippet is moderately sized (<= 1,200 chars), perform single bounded query
         if len(clean_code) <= 1200:
             results = collection.query(
                 query_texts=[clean_code],
                 n_results=min(DEFAULT_K, count),
+                include=["documents", "metadatas", "distances"],
             )
-            raw_docs = (results.get("documents") or [[]])[0]
-            # Deduplicate preserving order
-            unique_docs: List[str] = []
-            seen = set()
-            for doc in raw_docs:
-                if isinstance(doc, str) and doc.strip() and doc not in seen:
-                    seen.add(doc)
-                    unique_docs.append(doc)
-            return unique_docs[:DEFAULT_K]
+            return _evidence_from_query_results(results)
 
-        # For larger code snippets, query across overlapping windows and rank by distance
-        windows = _split_code_windows(clean_code)[:5]  # limit to top 5 windows
+        windows = _split_code_windows(clean_code)[:5]
         query_results = collection.query(
             query_texts=windows,
             n_results=min(DEFAULT_K, count),
+            include=["documents", "metadatas", "distances"],
         )
-
-        all_docs = query_results.get("documents") or []
-        all_dists = query_results.get("distances") or []
-
-        # Merge candidate documents by minimum distance
-        doc_best_dist = {}
-        for win_idx, docs in enumerate(all_docs):
-            dists = all_dists[win_idx] if win_idx < len(all_dists) else [1.0] * len(docs)
-            for doc, dist in zip(docs, dists):
-                if isinstance(doc, str) and doc.strip():
-                    if doc not in doc_best_dist or dist < doc_best_dist[doc]:
-                        doc_best_dist[doc] = dist
-
-        # Sort by distance (lower cosine distance = higher similarity)
-        sorted_candidates = sorted(doc_best_dist.items(), key=lambda kv: kv[1])
-        return [doc for doc, _ in sorted_candidates[:DEFAULT_K]]
-
-    except Exception:
-        logger.exception("Context retrieval encountered an unexpected error.")
+        candidates: dict[str, tuple[float, RetrievedEvidence]] = {}
+        for window_index in range(len(windows)):
+            for item in _evidence_from_query_results(query_results, window_index):
+                key = item.evidence_id or item.text
+                distance = item.distance if item.distance is not None else float("inf")
+                if key not in candidates or distance < candidates[key][0]:
+                    candidates[key] = (distance, item)
+        ordered = sorted(candidates.values(), key=lambda pair: pair[0])
+        return [item for _, item in ordered[:DEFAULT_K]]
+    except Exception as exc:
+        logger.warning(
+            "Structured context retrieval encountered an error (%s).",
+            type(exc).__name__,
+        )
         return []
+
+
+def retrieve_evidence(code: str, *, version: str | None = None,
+                      strategy: str | None = None, language: str | None = None,
+                      file_path: str | None = None) -> list[RetrievedEvidence]:
+    """Retrieve evidence from the explicitly selected corpus version.
+
+    Calls without options preserve the historical v2 behavior. Set
+    ``AI_CODE_REVIEWER_RAG_VERSION=v3`` to explicitly opt into v3; a missing v3
+    corpus/model raises an actionable error and never falls back to v2.
+    """
+    from rag.retrieve_v3 import retrieval_backend_selection
+
+    selected_version, selected_strategy = retrieval_backend_selection(version, strategy)
+    if selected_version == "v2":
+        return _retrieve_evidence_v2(code)
+    from rag.retrieve_v3 import retrieve_evidence_v3
+    return retrieve_evidence_v3(code, strategy=selected_strategy,
+                                language=language, file_path=file_path)
+
+
+def retrieve_evidence_with_diagnostics(
+    code: str, *, version: str | None = None, strategy: str | None = None,
+    language: str | None = None, file_path: str | None = None,
+) -> tuple[list[RetrievedEvidence], dict]:
+    """Return evidence plus optional per-call diagnostics without changing callers."""
+    from rag.retrieve_v3 import retrieval_backend_selection
+
+    selected_version, selected_strategy = retrieval_backend_selection(version, strategy)
+    if selected_version == "v3":
+        from rag.retrieve_v3 import _DEFAULT_V3, RetrievalConfig, V3Retriever
+        key = (str(__import__("rag.config", fromlist=["PROJECT_ROOT"]).PROJECT_ROOT /
+                    "rag" / "data" / "chroma_db_v3"), selected_strategy)
+        retriever = _DEFAULT_V3.setdefault(
+            key, V3Retriever(config=RetrievalConfig(strategy=selected_strategy))
+        )
+        return retriever.retrieve_with_diagnostics(code, language=language, file_path=file_path)
+    started = time.perf_counter()
+    evidence = _retrieve_evidence_v2(code)
+    diagnostics = {
+        "corpus_version": "v2", "strategy": "v2_baseline",
+        "selected_count": len(evidence),
+        "candidate_count": len(evidence),
+        "source_distribution": {}, "language_distribution": {},
+        "retrieval_seconds": time.perf_counter() - started,
+        "note": "The v2 collection does not persist the full v3 parent/language metadata contract.",
+    }
+    return evidence, diagnostics
+
+
+def retrieve_context(code: str) -> list[str]:
+    """Backward-compatible text-only retrieval interface."""
+    contexts = []
+    seen = set()
+    for item in retrieve_evidence(code):
+        if item.text not in seen:
+            seen.add(item.text)
+            contexts.append(item.text)
+    return contexts[:DEFAULT_K]

@@ -8,7 +8,7 @@
 [![MCP](https://img.shields.io/badge/Protocol-Model%20Context%20Protocol%20(FastMCP)-black.svg)](https://github.com/jlowin/fastmcp)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Critique** is an autonomous AI-powered code review system designed to evaluate GitHub Pull Requests in real time. It combines **Retrieval-Augmented Generation (RAG)** over engineering guidelines, a **domain fine-tuned Qwen 2.5 Coder 3B LoRA model** optimized for 4-bit consumer GPU execution, an **automated Easy/Hard difficulty classifier**, and an **MCP integration layer** with native desktop toast notifications and automated GitHub comment dispatching.
+**Critique** is an AI code review system combining **Retrieval-Augmented Generation (RAG)**, deterministic Python static analysis, structured findings, safe fix verification, and human-controlled export. Review inference can use a hosted provider or an explicitly selected CUDA-only Qwen2.5-Coder-3B-Instruct + PEFT adapter. Local inference uses Transformers and PEFT without automatic downloads, quantization, CPU/MPS fallback, or model loading during backend startup.
 
 ---
 
@@ -113,7 +113,9 @@ C:\Major-Project\
 │   │   ├── tokenizer.json          # Tokenizer vocabulary
 │   │   └── tokenizer_config.json   # Tokenizer parameters
 │   ├── base.py                     # Provider-independent BaseLLM abstract class
-│   ├── qwen_client.py              # QwenLLM client with 4-bit NF4 GPU quantization
+│   ├── qwen_client.py              # Compatibility entry point for CUDA PEFT Qwen
+│   ├── qwen_peft.py                # Lazy CUDA-only Transformers/PEFT provider
+│   ├── provider_factory.py         # Lazy review/fix provider selection
 │   └── groq_client.py              # Cloud API fallback client
 ├── rag/                            # Retrieval-Augmented Generation Module (v2)
 │   ├── adapters/                   # Data source adapters (Microsoft CodeReviewer, Security, Style)
@@ -143,6 +145,9 @@ C:\Major-Project\
 ---
 
 ## Installation & Setup
+
+For the current provider modes and safe CUDA provisioning procedure, see
+[Plan H CUDA deployment and validation](docs/PLAN_H_CUDA_DEPLOYMENT.md).
 
 ### Prerequisites
 - Python 3.10+ (tested on Python 3.12)

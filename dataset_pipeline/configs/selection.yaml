@@ -1,0 +1,13 @@
+selection_version: "1.0"
+allowed_splits: [train]
+# Example keys (leave empty until project quotas are approved):
+# min_quotas:
+#   source: {microsoft_codereviewer: 100}
+#   source_task: {comment_generation: 100}
+#   language: {python: 100}
+min_quotas: {}
+max_quotas: {}
+# Token budgets require --tokenizer-json pointing to an already available,
+# pinned tokenizer.json. No tokenizer/model download is performed.
+tokenizer_source: local_file_only
+default_seed: compact-corpus-v1

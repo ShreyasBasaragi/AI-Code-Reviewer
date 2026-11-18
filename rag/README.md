@@ -89,3 +89,11 @@ Run automated unit tests using `pytest`:
 ```bash
 pytest rag/tests/
 ```
+
+## Explicit corpus selection (Phase E3.3C)
+
+The application continues to use v2 by default. Existing `retrieve_evidence(code)` and `retrieve_context(code)` calls remain valid. To opt into v3 explicitly, set `AI_CODE_REVIEWER_RAG_VERSION=v3`; the optional `AI_CODE_REVIEWER_RAG_STRATEGY` accepts `v3_baseline` or `v3_optimized` (default for explicit v3 is optimized). Invalid selections and missing v3 artifacts raise an actionable configuration error; v3 never falls back to v2 or creates a collection. The v3 reader opens only `rag/data/chroma_db_v3/critique_code_context_v3` and generates query embeddings with the locally cached pinned MiniLM model in offline mode.
+
+`v3_baseline` mirrors the current v2 windowing, cosine-distance ranking, top-four selection, and exact chunk-ID deduplication. `v3_optimized` adds parent deduplication and bounded sibling context, conservative language ranking, soft source-family diversity, applicability diagnostics, and a conservative UTF-8-based context estimate. The estimate is not the Qwen or Groq tokenizer; its method is recorded in per-call diagnostics. Diagnostic details are available through `retrieve_evidence_with_diagnostics(...)`; the ordinary retrieval API still returns `RetrievedEvidence` objects.
+
+Production configuration remains v2. The v3 strategy and ablation options are experimental until independently human-judged relevance and controlled end-to-end results support a change.

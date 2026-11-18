@@ -1,0 +1,7 @@
+split_policy_version: "1.0"
+preserve_source_split: true
+default_training_split: train
+devign_candidate_split_status: unresolved
+group_keys_precedence: [pair_id, repository_and_pull_request_id, repository_and_commit_id, repository]
+rag_records_allowed: false
+official_holdout_integrity: unverified
