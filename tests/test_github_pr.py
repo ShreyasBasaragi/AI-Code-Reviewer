@@ -303,6 +303,26 @@ def test_pr_reviews_multiple_python_and_renamed_files_and_skips_non_python_delet
     assert result.completion_status == "partial"
 
 
+def test_pr_review_preserves_a_valid_empty_model_result_without_synthesizing_style_findings():
+    source = """def calculate_total(items):
+    runningTotal = 0
+    for item in items:
+        runningTotal = runningTotal + item
+    return runningTotal
+"""
+    result = GitHubPRReviewService(
+        FakePRClient([api_file("style_sample.py")], {
+            ("head-sha", "style_sample.py"): source,
+            ("base-sha", "style_sample.py"): source,
+        }),
+        reviewer=lambda *_: ReviewResponse(summary="No high-confidence issue found.", findings=()),
+    ).analyze("https://github.com/acme/repo/pull/4")
+
+    assert result.files_reviewed == 1
+    assert result.files[0].review_status == "reviewed"
+    assert result.files[0].findings == []
+
+
 def test_pr_malformed_and_oversized_diffs_are_reported_and_locations_suppressed():
     malformed = {**api_file("bad.py"), "patch": "@@ malformed"}
     oversized = api_file("large.py")

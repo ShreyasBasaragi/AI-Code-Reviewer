@@ -102,7 +102,8 @@ class GitHubActionCoordinator:
                         if isinstance(evidence, dict) and isinstance(evidence.get("evidence_id"), str)
                     }
                     cited = finding.get("evidence_ids")
-                    if not isinstance(cited, list) or not cited or any(item not in evidence_ids for item in cited):
+                    if (not isinstance(cited, (list, tuple)) or not cited
+                            or any(not isinstance(item, str) or item not in evidence_ids for item in cited)):
                         finding_for_policy["uncertain"] = True
                 policy = evaluate_finding(self.configs, PolicyInput(
                     repository=repository,

@@ -1,5 +1,6 @@
 import json
 import threading
+from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -9,7 +10,9 @@ from mcp_server.github_action_coordinator import GitHubActionCoordinator
 from mcp_server.github_actions import GitHubMCPActionAdapter
 from mcp_server.github_policy import PolicyDecision, RepositoryActionConfig
 from mcp_server.github_pr import GitHubPRException, PullRequestRef
+from mcp_server.github_pr import DiffMapping, PRAnalysisResult, PRFileResult, _finding_payload
 from mcp_server.github_webhook import WebhookDeliveryStore
+from review_schema import RetrievedEvidence, parse_review_response
 
 
 SHA = "a" * 40
@@ -316,6 +319,104 @@ def test_action_ledger_prevents_duplicate_comment_publication_and_records_outcom
     assert records[0]["publication_status"] == "published"
     assert records[0]["github_comment_id"] == 7
     assert records[0]["commit_sha"] is None
+
+
+def test_validated_pr_finding_tuple_evidence_reaches_inline_comment_adapter(tmp_path):
+    evidence = RetrievedEvidence(
+        evidence_id="rag-1", source_family="test", source_url=None,
+        rule_identifier=None, text="A relevant code-review rule.",
+    )
+    model_response = json.dumps({
+        "summary": "Security review finding.",
+        "findings": [{
+            "title": "Validate the input before processing",
+            "issue_type": "security",
+            "explanation": "The code uses input without validation.",
+            "recommended_fix": "Validate the input before use.",
+            "affected_file": "src/app.py", "line_start": 4, "line_end": 4,
+            "corrected_code": None, "evidence_ids": ["rag-1"],
+            "uncertain": False, "abstained": False,
+            "risk_priority": None, "verification_status": "not_checked",
+        }],
+    })
+    parsed = parse_review_response(model_response, [evidence])
+    assert parsed.valid and parsed.findings[0].uncertain is False
+    normalized_finding = _finding_payload(
+        parsed.findings[0], "src/app.py",
+        DiffMapping("mapped", added_lines=frozenset({4})), True,
+    )
+    assert normalized_finding["evidence_ids"] == ("rag-1",)
+
+    file_result = PRFileResult(
+        path="src/app.py", status="modified", additions=1, deletions=0,
+        review_status="reviewed", findings=[normalized_finding],
+        evidence=[asdict(evidence)],
+    )
+    review = PRAnalysisResult(
+        repository="acme/demo", owner="acme", repository_name="demo", number=17,
+        title="Review", state="open", base_sha=SHA, head_sha=SHA,
+        html_url="https://github.com/acme/demo/pull/17", total_changed_files=1,
+        files_received=1, files_reviewed=1, files_skipped=0, files_failed=0,
+        completion_status="complete", pagination_truncated=False, pagination_error=None,
+        findings_by_severity={"unknown": 1}, files=[file_result],
+        head_repository="acme/demo", head_branch="feature",
+    ).to_dict()
+    review["provider_identity"] = "test-provider"
+    assert isinstance(review["files"][0]["findings"][0]["evidence_ids"], tuple)
+
+    store = WebhookDeliveryStore(tmp_path / "tuple-evidence.sqlite3")
+    store.initialize()
+    requests = []
+    adapter = GitHubMCPActionAdapter(
+        read_client=ReadClient(), token="mocked-action-token",
+        transport=lambda method, url, headers, body: (
+            requests.append((method, url, json.loads(body))) or {"id": 456}
+        ),
+    )
+    coordinator = GitHubActionCoordinator(
+        store, read_client=adapter.read_client, adapter=adapter,
+        configs={"acme/demo": RepositoryActionConfig(publish_review_comments=True)},
+    )
+    event = {"delivery_id": "tuple-evidence-delivery", "owner": "acme",
+             "repository": "demo", "number": 17, "base_sha": SHA, "head_sha": SHA}
+    outcome = coordinator.process_review(event, review)
+
+    assert outcome["actions"][0]["action"] == "review_comment"
+    assert outcome["actions"][0]["eligible"] is True
+    assert outcome["actions"][0]["status"] == "published"
+    assert "security_or_high_severity" in outcome["actions"][0]["denial_reasons"]
+    assert len(requests) == 1
+    assert requests[0][0] == "POST"
+    assert requests[0][1].endswith("/repos/acme/demo/pulls/17/comments")
+    assert "rag-1" in requests[0][2]["body"]
+
+
+@pytest.mark.parametrize("finding,evidence", [
+    (valid_finding(evidence_ids=["not-present"]), [{"evidence_id": "rag-1"}]),
+    (valid_finding(uncertain=True), [{"evidence_id": "rag-1"}]),
+    (valid_finding(evidence_ids=[]), [{"evidence_id": "rag-1"}]),
+])
+def test_coordinator_keeps_invalid_or_uncertain_evidence_blocked(tmp_path, finding, evidence):
+    store = WebhookDeliveryStore(tmp_path / f"evidence-denial-{finding['finding_id']}-{finding['uncertain']}-{len(finding['evidence_ids'])}.sqlite3")
+    store.initialize()
+    requests = []
+    adapter = GitHubMCPActionAdapter(
+        read_client=ReadClient(), token="mocked-action-token",
+        transport=lambda *args: requests.append(args),
+    )
+    coordinator = GitHubActionCoordinator(
+        store, read_client=adapter.read_client, adapter=adapter,
+        configs={"acme/demo": RepositoryActionConfig(publish_review_comments=True)},
+    )
+    event = {"delivery_id": "invalid-evidence", "owner": "acme", "repository": "demo",
+             "number": 17, "base_sha": SHA, "head_sha": SHA}
+    review = {"repository": "acme/demo", "head_sha": SHA, "head_repository": "acme/demo",
+              "head_branch": "feature", "files": [{"path": "src/app.py", "status": "modified",
+              "evidence": evidence, "findings": [finding]}]}
+    result = coordinator.process_review(event, review)
+    assert result["actions"][0]["action"] == "no_external_action"
+    assert result["actions"][0]["denial_reasons"] == ["invalid_or_insufficient_finding_evidence"]
+    assert requests == []
 
 
 def test_coordinator_routes_unmappable_findings_to_one_policy_gated_general_comment(tmp_path):
