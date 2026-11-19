@@ -4,7 +4,7 @@ from mcp_server.github_policy import RepositoryActionConfig
 
 
 REPOSITORY = "ShreyasBasaragi/AI-Code-Reviewer"
-BRANCH = "test/github-webhook"
+BRANCH = "test/autocommit-final"
 
 
 class FakeCredentials:
@@ -25,9 +25,9 @@ def _environment():
         "GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY": "prototype",
         "GITHUB_CANDIDATE_STAGING_ENABLED": "true",
         "GITHUB_AUTONOMOUS_COMMIT_ENABLED": "true",
-        "GITHUB_CANDIDATE_WORKFLOW_ID": "123",
-        "GITHUB_BEHAVIORAL_ATTESTATION_WORKFLOW_ID": "456",
-        "GITHUB_BEHAVIORAL_TEST_BUNDLE_SHA256": "a" * 64,
+        "GITHUB_CANDIDATE_WORKFLOW_ID": "423879581",
+        "GITHUB_BEHAVIORAL_ATTESTATION_WORKFLOW_ID": "423879573",
+        "GITHUB_BEHAVIORAL_TEST_BUNDLE_SHA256": "9a03cb58ad6752b490185ad5da558beb824624e2d0a33efd92ccebcdbcf7e4cb",
         "GITHUB_BEHAVIORAL_ATTESTATION_HMAC_KEY": "h" * 32,
     }
 
@@ -35,12 +35,12 @@ def _environment():
 def _config():
     return RepositoryActionConfig(
         enable_autonomous_fixes=True,
-        allowed_low_risk_categories=("style",),
+        allowed_low_risk_categories=("formatting",),
         confidence_threshold=0.80,
         max_changed_lines=3,
         permitted_branches=(BRANCH,),
         required_checks=("syntax", "static", "behavioral", "ci"),
-        required_github_checks=("unit",),
+        required_github_checks=("candidate-syntax", "candidate-static", "candidate-regression"),
         allow_source_sharing=True,
     )
 

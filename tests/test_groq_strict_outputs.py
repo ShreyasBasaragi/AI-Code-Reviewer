@@ -165,6 +165,53 @@ def test_groq_provider_sends_strict_response_format(monkeypatch):
     }
 
 
+def test_groq_independently_assesses_static_formatting_with_strict_schema(monkeypatch):
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content='{"assessment":"supports","model_confidence_estimate":0.91}'))])
+
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setattr(groq_client, "Groq", lambda **_kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=FakeCompletions())
+    ))
+    provider = groq_client.GroqLLM(model="openai/gpt-oss-20b")
+    finding = {"rule_id": "PYFMT001", "issue_type": "formatting",
+               "title": "Missing spaces", "explanation": "Spaces missing.", "line_start": 2}
+
+    assessment = provider.assess_static_finding_confidence("value=1\n", finding)
+
+    assert assessment == {
+        "assessment": "supports",
+        "assessment_source": "groq_independent_static_assessment",
+        "model_confidence_estimate": 0.91,
+    }
+    assert calls[0]["response_format"]["json_schema"]["name"] == "static_finding_assessment"
+    assert "untrusted code" in calls[0]["messages"][1]["content"]
+
+
+@pytest.mark.parametrize("response", [
+    '{"assessment":"uncertain","model_confidence_estimate":0.99}',
+    '{"assessment":"supports","model_confidence_estimate":null}',
+    '{"assessment":"supports","model_confidence_estimate":1.2}',
+    '{"assessment":"supports","model_confidence_estimate":true}',
+])
+def test_groq_static_assessment_rejects_missing_or_invalid_confidence(monkeypatch, response):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
+    monkeypatch.setattr(groq_client, "Groq", lambda **_kwargs: SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **_args: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=response))]
+        )))
+    ))
+    provider = groq_client.GroqLLM(model="openai/gpt-oss-20b")
+    assert provider.assess_static_finding_confidence(
+        "value=1\n", {"rule_id": "PYFMT001", "issue_type": "formatting"}
+    ) is None
+
+
 def test_groq_fix_uses_strict_schema_pinned_to_requested_finding(monkeypatch):
     calls = []
 

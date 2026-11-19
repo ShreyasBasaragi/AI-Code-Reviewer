@@ -392,6 +392,13 @@ def create_app(service: Optional[ReviewFixService] = None,
             review_response, finding_id, source, llm=lifecycle._get_provider("fix"),
         )
 
+    def _assess_static_finding_confidence(finding, source):
+        provider = lifecycle._get_provider("review")
+        assess = getattr(provider, "assess_static_finding_confidence", None)
+        if not callable(assess):
+            return None
+        return assess(source, finding)
+
     def _behavioral_tests(_path):
         test_path = os.getenv("AI_CODE_REVIEWER_BEHAVIORAL_TEST_BUNDLE")
         if not test_path:
@@ -449,6 +456,7 @@ def create_app(service: Optional[ReviewFixService] = None,
         store=delivery_store, adapter=action_coordinator.adapter,
         fix_generator=_generate_autonomous_fix,
         confidence_resolver=_confidence_for_finding,
+        confidence_assessor=_assess_static_finding_confidence,
         behavioral_verifier=remote_verifier,
         github_behavioral_verifier=github_verifier,
         github_hosted_commit_policy=os.getenv("GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY", ""),

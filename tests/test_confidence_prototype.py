@@ -9,7 +9,7 @@ from mcp_server.github_policy import commit_execution_decision
 
 
 REPO = "ShreyasBasaragi/AI-Code-Reviewer"
-BRANCH = "test/groq-confidence-demo"
+BRANCH = "test/autocommit-final"
 
 
 def _enable(monkeypatch):
@@ -52,6 +52,9 @@ def test_prototype_evidence_requires_explicit_exact_disposable_branch_opt_in(mon
         "model_id": "openai/gpt-oss-20b",
         "finding_category": "style",
         "model_confidence_estimate": 0.91,
+        "finding_origin": "llm",
+        "assessment_source": "groq_review_finding",
+        "assessment_result": None,
         "prototype_policy": "academic_prototype",
         "prototype_repository": REPO,
         "prototype_branch": BRANCH,
@@ -78,6 +81,38 @@ def test_prototype_evidence_fails_closed_for_ineligible_findings(monkeypatch, fi
         finding, model_id="openai/gpt-oss-20b", repository=REPO,
         branch=BRANCH, permitted_branches=(BRANCH,),
     ) is None
+
+
+def test_static_formatting_prototype_requires_explicit_groq_assessment(monkeypatch):
+    _enable(monkeypatch)
+    finding = {
+        "origin": "static", "rule_id": "PYFMT001", "issue_type": "formatting",
+        "model_confidence_estimate": None,
+    }
+    assert model_estimate_confidence_evidence(
+        finding, model_id="openai/gpt-oss-20b", repository=REPO,
+        branch=BRANCH, permitted_branches=(BRANCH,),
+    ) is None
+    evidence = model_estimate_confidence_evidence(
+        finding, model_id="openai/gpt-oss-20b", repository=REPO,
+        branch=BRANCH, permitted_branches=(BRANCH,),
+        independent_assessment={
+            "assessment": "supports",
+            "assessment_source": "groq_independent_static_assessment",
+            "model_confidence_estimate": 0.91,
+        },
+    )
+    assert evidence["finding_origin"] == "static"
+    assert evidence["assessment_source"] == "groq_independent_static_assessment"
+    assert evidence["assessment_result"] == "supports"
+    assert verify_confidence_evidence(
+        evidence, repository=REPO, branch=BRANCH,
+        permitted_branches=(BRANCH,), threshold=0.80,
+    )
+    assert not verify_confidence_evidence(
+        {**evidence, "assessment_source": "groq_review_finding"}, repository=REPO,
+        branch=BRANCH, permitted_branches=(BRANCH,), threshold=0.80,
+    )
 
 
 def test_commit_decision_revalidates_prototype_policy_and_keeps_other_gates(monkeypatch):

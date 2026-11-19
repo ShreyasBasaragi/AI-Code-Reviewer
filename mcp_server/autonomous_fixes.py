@@ -13,6 +13,7 @@ from fix_generation import FixCandidate
 from mcp_server.behavioral_verification import BehavioralVerifier
 from mcp_server.confidence import (
     model_estimate_confidence_evidence,
+    model_estimate_prototype_enabled,
     valid_model_confidence_estimate,
 )
 from mcp_server.github_policy import (PolicyDecision, PolicyInput, evaluate_finding,
@@ -24,6 +25,7 @@ class AutonomousFixExecutor:
     def __init__(self, *, store: Any, adapter: Any,
                  fix_generator: Callable[[Any, str, str], FixCandidate],
                  confidence_resolver: Callable[[Mapping[str, Any]], Optional[Mapping[str, Any]]],
+                 confidence_assessor: Optional[Callable[[Mapping[str, Any], str], Optional[Mapping[str, Any]]]] = None,
                  behavioral_verifier: Optional[BehavioralVerifier] = None,
                  github_behavioral_verifier: Optional[Any] = None,
                  github_hosted_commit_policy: Optional[str] = None,
@@ -33,6 +35,7 @@ class AutonomousFixExecutor:
         self.adapter = adapter
         self.fix_generator = fix_generator
         self.confidence_resolver = confidence_resolver
+        self.confidence_assessor = confidence_assessor
         self.behavioral_verifier = behavioral_verifier
         self.github_behavioral_verifier = github_behavioral_verifier
         self.github_hosted_commit_policy = (
@@ -91,11 +94,28 @@ class AutonomousFixExecutor:
             return blocked("validated_review_source_unavailable")
         confidence = self.confidence_resolver(finding)
         branch = review.get("head_branch")
-        if (not isinstance(confidence, Mapping) and finding.get("origin") == "llm"
-                and isinstance(branch, str)):
+        independent_assessment = None
+        prototype_scope = (
+            isinstance(branch, str)
+            and model_estimate_prototype_enabled(
+                repository=repo, branch=branch, permitted_branches=config.permitted_branches,
+            )
+        )
+        if (not isinstance(confidence, Mapping) and prototype_scope
+                and finding.get("origin") == "static"
+                and finding.get("issue_type") == "formatting"
+                and finding.get("rule_id") == "PYFMT001"
+                and self.confidence_assessor is not None):
+            try:
+                independent_assessment = self.confidence_assessor(finding, original_code)
+            except Exception:
+                independent_assessment = None
+        if (not isinstance(confidence, Mapping) and isinstance(branch, str)
+                and (finding.get("origin") == "llm" or independent_assessment is not None)):
             confidence = model_estimate_confidence_evidence(
                 finding, model_id=review.get("provider_identity"), repository=repo,
                 branch=branch, permitted_branches=config.permitted_branches,
+                independent_assessment=independent_assessment,
             )
         if not isinstance(confidence, Mapping):
             return blocked("confidence_evidence_unavailable")

@@ -111,6 +111,31 @@ def groq_review_response_format() -> dict[str, Any]:
     }
 
 
+def groq_static_finding_assessment_format() -> dict[str, Any]:
+    """Strict Groq response format for independently checking one static rule."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "static_finding_assessment",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "assessment": {"type": "string", "enum": ["supports", "rejects", "uncertain"]},
+                    "model_confidence_estimate": {
+                        "anyOf": [
+                            {"type": "number", "minimum": 0, "maximum": 1},
+                            {"type": "null"},
+                        ]
+                    },
+                },
+                "required": ["assessment", "model_confidence_estimate"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
 FIX_OUTPUT_INSTRUCTIONS = """Return exactly one JSON object with this shape:
 {
   "finding_ref": "the supplied finding reference, unchanged",

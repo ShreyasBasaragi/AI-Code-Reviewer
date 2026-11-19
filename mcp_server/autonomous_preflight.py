@@ -53,8 +53,8 @@ def run_autonomous_commit_preflight(
         "branch_must_be_disposable_test_branch")
     record("repository_autonomous_opt_in", config.enable_autonomous_fixes,
         "repository_autonomous_fixes_not_enabled")
-    record("style_category_allowlisted", "style" in config.allowed_low_risk_categories,
-        "style_category_not_allowlisted")
+    record("formatting_category_allowlisted", "formatting" in config.allowed_low_risk_categories,
+        "formatting_category_not_allowlisted")
     record("branch_permitted_by_repository_policy", branch in config.permitted_branches,
         "branch_not_permitted_by_repository_policy")
     record("source_sharing_policy", config.allow_source_sharing

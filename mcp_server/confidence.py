@@ -55,17 +55,31 @@ def model_estimate_prototype_enabled(*, repository: str, branch: str,
 def model_estimate_confidence_evidence(
     finding: Mapping[str, Any], *, model_id: Optional[str], repository: str,
     branch: str, permitted_branches: Iterable[str],
+    independent_assessment: Optional[Mapping[str, Any]] = None,
 ) -> Optional[dict[str, Any]]:
     """Build explicitly uncalibrated evidence only for the opt-in test scope."""
     category = finding.get("issue_type")
+    origin = finding.get("origin", "llm")
+    assessment_source = "groq_review_finding"
+    estimate = finding.get("model_confidence_estimate")
+    if origin == "static":
+        if (category != "formatting" or finding.get("rule_id") != "PYFMT001"
+                or not isinstance(independent_assessment, Mapping)
+                or independent_assessment.get("assessment") != "supports"
+                or independent_assessment.get("assessment_source")
+                != "groq_independent_static_assessment"):
+            return None
+        assessment_source = "groq_independent_static_assessment"
+        estimate = independent_assessment.get("model_confidence_estimate")
     if (not isinstance(category, str) or category not in _MODEL_ESTIMATE_CATEGORIES
+            or origin not in {"llm", "static"}
             or not isinstance(model_id, str)
             or not model_id.strip()
             or not model_estimate_prototype_enabled(
                 repository=repository, branch=branch, permitted_branches=permitted_branches
             )):
         return None
-    score = valid_model_confidence_estimate(finding.get("model_confidence_estimate"))
+    score = valid_model_confidence_estimate(estimate)
     if score is None or score < 0.80:
         return None
     return {
@@ -75,6 +89,9 @@ def model_estimate_confidence_evidence(
         "model_id": model_id,
         "finding_category": category,
         "model_confidence_estimate": score,
+        "finding_origin": origin,
+        "assessment_source": assessment_source,
+        "assessment_result": "supports" if origin == "static" else None,
         "prototype_policy": MODEL_ESTIMATE_CONFIDENCE_POLICY,
         "prototype_repository": repository,
         "prototype_branch": branch,
@@ -114,6 +131,14 @@ def verify_confidence_evidence(evidence: Any, *, repository: str, branch: str,
         and isinstance(evidence_branch, str) and evidence_branch == branch
         and isinstance(evidence.get("finding_category"), str)
         and evidence.get("finding_category") in _MODEL_ESTIMATE_CATEGORIES
+        and (
+            (evidence.get("finding_origin") == "llm"
+             and evidence.get("assessment_source") == "groq_review_finding")
+            or (evidence.get("finding_origin") == "static"
+                and evidence.get("finding_category") == "formatting"
+                and evidence.get("assessment_source") == "groq_independent_static_assessment"
+                and evidence.get("assessment_result") == "supports")
+        )
         and isinstance(evidence.get("model_id"), str) and bool(evidence.get("model_id").strip())
         and score is not None
         and valid_model_confidence_estimate(threshold) is not None

@@ -467,29 +467,69 @@ def test_webhook_review_runs_full_mocked_fix_stage_ci_and_nonforce_commit(tmp_pa
     assert sum(method == "PATCH" for method, *_ in transport.calls) == 1
 
 
-def test_prototype_model_estimate_runs_only_with_explicit_test_branch_scope(monkeypatch, tmp_path):
-    branch = "test/groq-confidence-prototype"
+def _enable_formatting_prototype(monkeypatch):
     monkeypatch.setenv("GITHUB_MODEL_CONFIDENCE_POLICY", "academic_prototype")
     monkeypatch.setenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_REPOSITORY", "acme/demo")
-    monkeypatch.setenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_BRANCH", branch)
-    coordinator, store, _adapter, transport, event, runtime = make_coordinator(
-        tmp_path, confidence=None,
-    )
+    monkeypatch.setenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_BRANCH", FORMAT_BRANCH)
+
+
+def test_static_formatting_prototype_requires_groq_assessment_and_preserves_origin(monkeypatch, tmp_path):
+    _enable_formatting_prototype(monkeypatch)
+    coordinator, store, _adapter, transport, event, runtime, payload = exact_formatting_case(tmp_path)
     coordinator.autonomous_executor.confidence_resolver = lambda _finding: None
-    coordinator.configs["acme/demo"] = config(permitted_branches=(branch,))
-    coordinator.adapter.read_client.branch = branch
-    payload = review_payload(finding(model_confidence_estimate=0.91))
-    payload["head_branch"] = branch
+    assessments = []
+    coordinator.autonomous_executor.confidence_assessor = lambda finding, source: (
+        assessments.append((finding["origin"], finding["rule_id"], source == FORMAT_SAMPLE))
+        or {"assessment_source": "groq_independent_static_assessment",
+            "assessment": "supports",
+            "model_confidence_estimate": 0.91}
+    )
 
     result = coordinator.process_review(event, payload, runtime_files=runtime)
 
     action = result["actions"][0]
     assert action["status"] == "published", action
+    assert assessments == [("static", "PYFMT001", True)]
     assert action["confidence"]["confidence_source"] == "uncalibrated_model_estimate"
     assert action["confidence"]["calibrated"] is False
+    assert action["confidence"]["finding_origin"] == "static"
+    assert action["confidence"]["assessment_source"] == "groq_independent_static_assessment"
     assert action["commit_sha"] == CANDIDATE
     assert store.get_actions("delivery-1")[0]["commit_sha"] == CANDIDATE
     assert sum(method == "PATCH" for method, *_ in transport.calls) == 1
+
+
+def test_static_formatting_prototype_blocks_missing_or_low_groq_assessment(monkeypatch, tmp_path):
+    _enable_formatting_prototype(monkeypatch)
+    for score in (None, 0.79):
+        coordinator, _store, _adapter, transport, event, runtime, payload = exact_formatting_case(
+            tmp_path / str(score),
+        )
+        coordinator.autonomous_executor.confidence_resolver = lambda _finding: None
+        coordinator.autonomous_executor.confidence_assessor = (
+            lambda _finding, _source, score=score: None if score is None else {
+                "assessment_source": "groq_independent_static_assessment",
+                "assessment": "supports",
+                "model_confidence_estimate": score,
+            }
+        )
+        result = coordinator.process_review(event, payload, runtime_files=runtime)
+        assert result["actions"][0]["reason"] == "confidence_evidence_unavailable"
+        assert not any(method in {"POST", "PATCH"} for method, *_ in transport.calls)
+
+
+def test_static_formatting_assessor_is_not_called_outside_exact_prototype_branch(monkeypatch, tmp_path):
+    _enable_formatting_prototype(monkeypatch)
+    coordinator, _store, _adapter, transport, event, runtime, payload = exact_formatting_case(
+        tmp_path, branch="test/other-disposable-branch",
+    )
+    coordinator.autonomous_executor.confidence_resolver = lambda _finding: None
+    calls = []
+    coordinator.autonomous_executor.confidence_assessor = lambda *_args: calls.append(True)
+    result = coordinator.process_review(event, payload, runtime_files=runtime)
+    assert calls == []
+    assert result["actions"][0]["reason"] == "confidence_evidence_unavailable"
+    assert not any(method in {"POST", "PATCH"} for method, *_ in transport.calls)
 
 
 def test_tuple_evidence_ids_remain_valid_through_autonomous_fix_pipeline(tmp_path):
