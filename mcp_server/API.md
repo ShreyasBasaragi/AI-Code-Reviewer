@@ -1,5 +1,41 @@
 # FastAPI service
 
+## Autonomous fix status (2026-11-19)
+
+The current implementation can stage a candidate revision, verify it, and
+advance the pull request branch through a narrow non-force GitHub ref update.
+This path is disabled by default and fails closed unless repository policy,
+separate staging and final-write credentials, signed confidence evidence,
+an attested remote behavioral verifier, candidate-specific CI, source/diff
+checks, and all runtime gates pass. Configure the independent write switches
+`GITHUB_CANDIDATE_STAGING_ENABLED` and `GITHUB_AUTONOMOUS_COMMIT_ENABLED` only
+after reviewing the deployment. Tokens can be stored separately as
+`github_candidate_staging_token` and `github_autonomous_commit_token`; the
+existing action policy must explicitly opt the repository in. The verifier,
+calibration artifact, workflow identity, and required CI checks are configured
+through `AI_CODE_REVIEWER_SANDBOX_URL` plus
+`AI_CODE_REVIEWER_SANDBOX_HMAC_KEY`,
+`AI_CODE_REVIEWER_RUNTIME_CALIBRATION_PATH` plus
+`AI_CODE_REVIEWER_CALIBRATION_DATASET_ID`, the numeric
+`GITHUB_CANDIDATE_WORKFLOW_ID`, and repository `required_github_checks`
+respectively. The staging token must also be permitted to dispatch the
+configured Actions workflow. The test bundle is selected
+by `AI_CODE_REVIEWER_BEHAVIORAL_TEST_BUNDLE`.
+
+After staging a candidate, the adapter dispatches the configured workflow on
+that candidate branch and polls exact-SHA check/status evidence for at most 60
+seconds by default (bounded to 180 seconds). Set
+`GITHUB_CANDIDATE_CI_WAIT_SECONDS` to tune that bounded wait; pending or missing
+checks at the deadline block finalization.
+
+`GET /api/verification/capabilities` reports configuration presence without
+performing external checks; it does not prove a credential can write, a remote
+broker is trustworthy, a calibration artifact passes per-finding validation,
+or candidate CI is green. Live GitHub writes, live model requests, and
+behavioral execution were not performed for this implementation. The Task
+J2/J3 sections below document the earlier implementation state and are
+superseded where they say commit execution is permanently disabled.
+
 Start the HTTP API from the repository root:
 
 ```sh
@@ -26,9 +62,10 @@ offline-only; there is no automatic model download, CPU/MPS fallback, or
 quantization. The default gate requires 8 GiB free CUDA memory before loading.
 See [CUDA deployment and validation](../docs/PLAN_H_CUDA_DEPLOYMENT.md).
 
-Set `AI_CODE_REVIEWER_CORS_ORIGINS` to a comma-separated list of development
-origins. The default allows `http://localhost:3000` and
-`http://127.0.0.1:3000`; wildcard origins are ignored.
+Set `AI_CODE_REVIEWER_CORS_ORIGINS` to a comma-separated list of exact browser
+origins. The development defaults include ports 3000 and 5173 on `localhost`
+and `127.0.0.1`; wildcard origins are ignored. Same-origin production
+deployments should set this to their exact HTTPS frontend origin.
 
 The MCP and HTTP interfaces use the same bounded, in-memory lifecycle state when
 they run in the same process. Handles are limited to the most recent 32 reviews
@@ -58,7 +95,7 @@ and fix handles above remain process-local.
 - `POST /api/github/webhook` — signed GitHub pull-request event; returns `202` with the delivery ID and status
 - `GET /api/github/webhook/deliveries/{delivery_id}` — requires `Authorization: Bearer <GITHUB_WEBHOOK_STATUS_TOKEN>`
 - `GET /api/github/webhook/deliveries/{delivery_id}/actions` — authenticated action status only; omits full review result
-- `POST /api/github/webhook/deliveries/{delivery_id}/actions/{action_id}/reconcile` — authenticated remote-state read for an ambiguous inline comment
+- `POST /api/github/webhook/deliveries/{delivery_id}/actions/{action_id}/reconcile` — authenticated remote-state read for an ambiguous inline or general comment
 - `POST /api/admin/setup` — loopback-only first-run bootstrap and password initialization
 - `POST /api/admin/session` — password login (or temporary legacy-token exchange) for a 15-minute HttpOnly, SameSite=Strict browser session; HTTP login is loopback-only and remote clients require HTTPS
 - `POST /api/admin/password-reset` — loopback-only single-use recovery-token reset
@@ -74,15 +111,31 @@ and fix handles above remain process-local.
 - `GET /api/admin/github/webhook` — endpoint, signed-delivery, processing, and reachability status without exposing the secret
 - `GET /api/admin/audit` — bounded administrator security and configuration events without secret values
 
-Administrator passwords are Argon2id-hashed in an owner-only SQLite file. The path defaults to `~/Library/Application Support/AI Code Reviewer/admin.sqlite3` on macOS, or the XDG state directory elsewhere; override with `AI_CODE_REVIEWER_AUTH_DB_PATH` or `AI_CODE_REVIEWER_STATE_DIR`. Startup prints a one-time bootstrap credential locally when first-run setup is needed and prints the recovery command on every launch. Use `python -m mcp_server.admin_cli reset-password` in a local interactive terminal for a 10-minute one-time reset credential. `AI_CODE_REVIEWER_ADMIN_TOKEN` remains a temporary migration/emergency Bearer path; remove it from the backend environment after password setup and login have been verified.
+Administrator passwords are Argon2id-hashed in an owner-only SQLite file. The path defaults to `~/Library/Application Support/AI Code Reviewer/admin.sqlite3` on macOS, or the XDG state directory elsewhere; override with `AI_CODE_REVIEWER_AUTH_DB_PATH` or `AI_CODE_REVIEWER_STATE_DIR`. Startup initializes authentication, lifecycle, webhook delivery, and GitHub action SQLite schemas before serving requests; a storage initialization failure stops startup. By default startup prints a one-time bootstrap credential locally when first-run setup is needed and prints the recovery command on every launch. Set `AI_CODE_REVIEWER_PRINT_BOOTSTRAP_CREDENTIAL=false` to withhold that one-time value from logs; deployment Compose uses this mode. Use `python -m mcp_server.admin_cli setup-password` or `change-password` from an interactive local terminal when a trusted loopback web route is unavailable. The existing `reset-password` command still issues a 10-minute one-time web recovery credential. `AI_CODE_REVIEWER_ADMIN_TOKEN` remains a temporary migration/emergency Bearer path; remove it from the backend environment after password setup and login have been verified.
 
-Browser sessions are stored as token hashes in the protected state database and expire after 15 minutes. Cookie-authenticated state changes require an allowed `Origin`; setup and password recovery additionally reject forwarded-peer headers and require a loopback peer. Configure exact frontend origins with `AI_CODE_REVIEWER_CORS_ORIGINS`. The local defaults include ports 3000 and 5173. Legacy Bearer authentication remains available for existing non-browser clients while the migration variable is configured.
+Browser sessions are stored as token hashes in the protected state database and expire after 15 minutes. Cookie-authenticated state changes require an allowed `Origin`; setup and password recovery require the effective request peer and host to be loopback. When reverse proxying, run Uvicorn with proxy headers trusted only from the isolated proxy network, and have the proxy overwrite forwarded client/scheme headers. A sanitized forwarded loopback client is accepted; a remote effective peer is still rejected. Configure exact frontend origins with `AI_CODE_REVIEWER_CORS_ORIGINS`. Legacy Bearer authentication remains available for existing non-browser clients while the migration variable is configured.
 
-GitHub and webhook credentials use macOS Keychain persistence where available. Other platforms can opt into process-memory-only storage; persistent writes fail closed if a secure OS store is unavailable. Environment credentials remain available during migration and cannot be removed through the UI. The canonical action-policy file is the existing `GITHUB_ACTION_POLICY_PATH`, or an owner-only file under the application state directory when unset. Updates use the existing policy parser, cross-process file locking, revision checks, and atomic replacement. Autonomous commit execution remains hard-disabled regardless of editable repository policy.
+GitHub and webhook credentials use macOS Keychain persistence where available. Other platforms can opt into process-memory-only storage; persistent writes fail closed if a secure OS store is unavailable. Environment credentials remain available during migration and cannot be removed through the UI. The canonical action-policy file is the existing `GITHUB_ACTION_POLICY_PATH`, or an owner-only file under the application state directory when unset. Updates use the existing policy parser, cross-process file locking, revision checks, and atomic replacement. Autonomous commit execution is disabled by default and requires independent runtime authorization; editable repository policy alone cannot authorize a write.
 
 Review submission, manual PR review, webhook review, and generated fix responses include `provider_identity` when the active provider exposes it. Connectivity status is separate from successful model inference, and must not be presented as proof that a review or fix generation succeeded.
 - `GET /api/verification/capabilities` — reports verification gates and blockers
 - `GET /api/health`
+
+`/api/health` reports process/provider selection and durable state readiness;
+it does not contact Groq, validate API credentials with the provider, or check
+the RAG corpus. SQLite stores are initialized during startup, before health
+requests can be served.
+
+The verification capabilities response is additive and reports whether
+candidate staging, remote behavioral verification, calibration, CI workflow,
+and commit credentials are configured. Configuration presence is not a live
+health check. Read-only CI evidence must match an exact candidate SHA; a pull
+request's pre-change head is not candidate evidence. Behavioral tests are `Not
+Run` unless a separately reviewed isolated execution broker is configured.
+Candidate code is never executed in the FastAPI process. If the owner enables
+the independent gates and all per-action checks pass, an attested remote broker
+may execute the configured test bundle and the adapter may advance the PR head
+branch with a non-force GitHub ref update.
 
 `POST /api/reviews` includes an additive `timings` object with request
 validation, RAG retrieval, provider generation, response validation, static
@@ -114,10 +167,10 @@ delivery ID reused with a different body is rejected. A separate status token
 is required to retrieve private PR findings. Persisted evidence text is omitted;
 the result keeps findings, evidence IDs, and provenance metadata.
 
-## J2 policy-gated GitHub actions
+## J2 policy-gated GitHub actions (historical implementation baseline)
 
-The signed webhook worker may publish validated inline review comments only
-after both repository policy and a dedicated action credential authorize it.
+The signed webhook worker may publish validated review comments only after
+both repository policy and a dedicated action credential authorize it.
 Comments are **off by default**. Configure `GITHUB_ACTION_POLICY_PATH` to an
 administrator-managed JSON file using version `github-action-policy-v1`; there
 is no HTTP or MCP policy mutation endpoint. Unknown fields, invalid settings,
@@ -129,11 +182,14 @@ For comment publication, grant only fine-grained **Pull requests: write** access
 to the intended repositories. Keep `publish_review_comments` false until the
 owner/admin has explicitly approved the configuration and credential. Inline
 comments require a current open PR, exact repository and head SHA, a validated
-finding, and one changed new-side line. Unmappable locations are recorded as
-skipped; J2 does not post summary comments or unrelated top-level comments.
-Comment bodies are bounded and include AI provenance and evidence IDs, never
-retrieved evidence text. Ambiguous write failures are recorded as `unknown` and
-are not retried automatically.
+finding, and one changed new-side line. Findings without a safe inline location
+use a general pull-request issue comment under the same policy, credential,
+finding-validation, and current-head checks. Both comment types carry a durable
+operation marker and can be reconciled after an ambiguous write; duplicate
+delivery IDs do not publish twice. Comment bodies are bounded and include AI or
+static-analysis provenance and evidence IDs, never retrieved evidence text.
+Ambiguous write failures are recorded as `unknown` and are not retried
+automatically. No commit operation is performed.
 
 The action policy allows only style/naming/formatting as possible low-risk
 categories, requires independent confidence >= 0.80 and at most three changed
@@ -168,20 +224,25 @@ comment dispatcher.
 See [`PLAN_J2_AUTONOMOUS_ACTIONS.md`](../docs/PLAN_J2_AUTONOMOUS_ACTIONS.md) for
 the policy format, action details, limits, tests, and J3 dependencies.
 
-## J3 verification and provider administration
+## J3 verification and provider administration (historical implementation baseline)
 
 The calibration evaluator requires a signed manifest for the exact labeled
 dataset. The current model response schema supplies no confidence score or
-per-finding calibration map, so runtime confidence remains unavailable.
-Behavioral verification delegates only to a separately supplied, attesting
-sandbox broker; no broker is configured, and the default is `not_run`. Never
-execute candidate tests inside FastAPI. Required GitHub check results distinguish
+per-finding calibration map; runtime confidence is therefore available only
+from a separately signed independent artifact, and otherwise remains
+unavailable. Behavioral verification delegates only to a separately supplied,
+attesting sandbox broker and defaults to `not_run`. Never execute candidate
+tests inside FastAPI. Required GitHub check results distinguish
 success, failure, pending, skipped, missing, and unknown and must match the
 candidate SHA. CI on the original PR head is not candidate verification.
 
-The commit gate remains hard-disabled. This implementation does not create a
-candidate revision, provide isolated execution, implement atomic branch
-compare-and-swap, or have signed calibration data or live staging evidence.
+Commit execution is disabled by default. The implementation creates a separate
+candidate revision, delegates tests to an attesting remote broker, checks
+candidate-specific CI, validates signed calibration evidence, and performs a
+non-force branch ref update after a final freshness check. It does not have
+live staging evidence or a true GitHub compare-and-swap API; concurrent branch
+updates are rejected by the non-force update. Production readiness is not
+established by offline tests.
 Provider settings require the administrator session described above (or the
 temporary `AI_CODE_REVIEWER_ADMIN_TOKEN` migration path); they redact keys.
 Keys submitted through the provider-settings API remain in process memory only
@@ -248,3 +309,35 @@ acceptance. Behavioral tests are always reported as `not_run`; this workflow
 does not execute or apply candidate code. Each syntax/static check reports
 `passed`, `failed`, `errored`, or `not_run` as applicable; syntax parse errors
 are `failed`, while check/input errors are `errored`.
+
+## Durable review lifecycle and operator recovery
+
+Review and fix lifecycle records are stored in a private, local SQLite database so
+an administrator can continue a review after an API restart. Source, candidate,
+and review payloads are bounded and expire under the configured retention policy;
+approval/rejection audit entries retain the actor, timestamp, source digest, and
+verification summary without storing raw provider responses. Administrator
+session authentication is required for review/fix lifecycle actions and webhook
+operations. This store supports the single local application instance; it is not
+a multi-tenant or distributed database.
+
+Webhook operations use bounded automatic retries only for known transient review
+failures. An authenticated administrator can inspect recent delivery/action
+metadata and request an eligible retry. A delivery is not replayed after any
+GitHub action has been recorded. Comment retries first reconcile remote GitHub
+state, re-check the current repository policy, and obey a bounded attempt count.
+Unknown write outcomes require reconciliation and are never blindly retried.
+Credentials, source files, comment bodies, and evidence text are excluded from
+the operational listing. Each record includes a server-computed
+`retry_available` flag; the retry endpoint revalidates eligibility and current
+policy. These controls do not enable GitHub comments or commits. Any comment
+publication remains subject to the existing explicit repository policy and
+bounded webhook workflow.
+
+The authenticated frontend may recover a review with `GET /api/reviews/{id}` or
+a candidate with `GET /api/fixes/{id}` after restart. These endpoints require
+the administrator session cookie. They return only the requested known record,
+not an unauthenticated listing. Review source remains in the backend lifecycle
+store and is not copied into browser storage. Missing and expired records both
+return 404 (`review_not_found_or_expired` or `candidate_not_found_or_expired`);
+the current contract does not distinguish an explicitly deleted item.

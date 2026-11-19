@@ -109,6 +109,8 @@ class CredentialStore:
     ENVIRONMENT = {
         "github_token": "GITHUB_TOKEN",
         "github_actions_token": "GITHUB_ACTIONS_TOKEN",
+        "github_candidate_staging_token": "GITHUB_CANDIDATE_STAGING_TOKEN",
+        "github_autonomous_commit_token": "GITHUB_AUTONOMOUS_COMMIT_TOKEN",
         "webhook_secret": "GITHUB_WEBHOOK_SECRET",
     }
 
@@ -184,6 +186,8 @@ class CredentialStore:
         return {
             "github_token_configured": configured("github_token"),
             "github_actions_token_configured": configured("github_actions_token"),
+            "github_candidate_staging_token_configured": configured("github_candidate_staging_token"),
+            "github_autonomous_commit_token_configured": configured("github_autonomous_commit_token"),
             "webhook_secret_configured": configured("webhook_secret"),
             "persistent_storage_available": persistent,
             "storage_mode": "macos_keychain_available" if persistent else "session_only_available",

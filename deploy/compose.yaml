@@ -1,0 +1,102 @@
+name: codementor
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    restart: unless-stopped
+    environment:
+      AI_CODE_REVIEWER_API_URL: http://api:8000
+      AI_CODE_REVIEWER_FRONTEND_URL: ${APP_ORIGIN:?Set APP_ORIGIN to the deployed frontend origin}
+      AI_CODE_REVIEWER_CORS_ORIGINS: ${APP_ORIGIN:?Set APP_ORIGIN to the deployed frontend origin}
+      AI_CODE_REVIEWER_STATE_DIR: /var/lib/ai-code-reviewer
+      AI_CODE_REVIEWER_WEBHOOK_DB_PATH: /var/lib/ai-code-reviewer/github_webhook_deliveries.sqlite3
+      AI_CODE_REVIEWER_PRINT_BOOTSTRAP_CREDENTIAL: "false"
+      AI_CODE_REVIEWER_PROVIDER: ${AI_CODE_REVIEWER_PROVIDER:-groq}
+      AI_CODE_REVIEWER_FIX_PROVIDER: ${AI_CODE_REVIEWER_FIX_PROVIDER:-groq}
+      AI_CODE_REVIEWER_SOURCE_SHARING_CONSENT: ${AI_CODE_REVIEWER_SOURCE_SHARING_CONSENT:-false}
+      AI_CODE_REVIEWER_RAG_VERSION: ${AI_CODE_REVIEWER_RAG_VERSION:-v2}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-openai/gpt-oss-20b}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_ACTIONS_TOKEN: ${GITHUB_ACTIONS_TOKEN:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
+      GITHUB_WEBHOOK_STATUS_TOKEN: ${GITHUB_WEBHOOK_STATUS_TOKEN:-}
+    volumes:
+      - app_state:/var/lib/ai-code-reviewer
+      - type: bind
+        source: ${RAG_V2_DB_PATH:?Set RAG_V2_DB_PATH to the existing v2 corpus directory}
+        target: /app/rag/data/chroma_db_v2
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${RAG_V3_DB_PATH:?Set RAG_V3_DB_PATH to the existing v3 corpus directory}
+        target: /app/rag/data/chroma_db_v3
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${HF_MODEL_CACHE_PATH:?Set HF_MODEL_CACHE_PATH to the pre-provisioned Hugging Face cache}
+        target: /var/cache/huggingface
+        read_only: true
+        bind:
+          create_host_path: false
+    expose:
+      - "8000"
+    networks:
+      - app
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        VITE_API_BASE_URL: /
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-8080}:8080"
+    networks:
+      - app
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:rw,noexec,nosuid,size=16m
+      - /var/run:rw,noexec,nosuid,size=4m
+      - /tmp:rw,noexec,nosuid,size=4m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  app:
+    driver: bridge
+
+volumes:
+  app_state:

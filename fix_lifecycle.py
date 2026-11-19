@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from dataclasses import asdict, dataclass, replace
 from typing import Optional
 
@@ -59,15 +60,15 @@ def record_verification(candidate: FixCandidate, report) -> FixCandidate:
     )
 
 
-def accept_fix_candidate(candidate: FixCandidate) -> FixApprovalResult:
-    return _decide(candidate, "accepted")
+def accept_fix_candidate(candidate: FixCandidate, *, actor_id: str = "unattributed") -> FixApprovalResult:
+    return _decide(candidate, "accepted", actor_id=actor_id)
 
 
-def reject_fix_candidate(candidate: FixCandidate) -> FixApprovalResult:
-    return _decide(candidate, "rejected")
+def reject_fix_candidate(candidate: FixCandidate, *, actor_id: str = "unattributed") -> FixApprovalResult:
+    return _decide(candidate, "rejected", actor_id=actor_id)
 
 
-def _decide(candidate: FixCandidate, decision: str) -> FixApprovalResult:
+def _decide(candidate: FixCandidate, decision: str, *, actor_id: str) -> FixApprovalResult:
     if not isinstance(candidate, FixCandidate):
         raise TypeError("candidate must be a FixCandidate")
     current = candidate.approval_status
@@ -81,7 +82,7 @@ def _decide(candidate: FixCandidate, decision: str) -> FixApprovalResult:
         )
     if current in {"accepted", "rejected"}:
         message = f"Candidate is already {current}; conflicting {decision} action was not applied."
-        updated = _append_event(candidate, decision, "conflict", message)
+        updated = _append_event(candidate, decision, "conflict", message, actor_id)
         return FixApprovalResult(updated, decision, current, "conflict", message, "conflicting_decision")
 
     if decision == "accepted":
@@ -91,7 +92,7 @@ def _decide(candidate: FixCandidate, decision: str) -> FixApprovalResult:
         eligible = _verification_passed(candidate, report)
         if not eligible:
             message = "Acceptance requires matching successful syntax and static-analysis verification; behavioral tests were not run."
-            updated = _append_event(candidate, decision, "blocked", message)
+            updated = _append_event(candidate, decision, "blocked", message, actor_id)
             return FixApprovalResult(
                 updated, decision, current, "blocked", message, "required_verification_failed"
             )
@@ -102,14 +103,24 @@ def _decide(candidate: FixCandidate, decision: str) -> FixApprovalResult:
         else "Candidate explicitly rejected; original review and source remain unchanged."
     )
     updated = replace(candidate, approval_status=decision)
-    updated = _append_event(updated, decision, decision, message)
+    updated = _append_event(updated, decision, decision, message, actor_id)
     return FixApprovalResult(updated, decision, decision, decision, message)
 
 
 def _append_event(
-    candidate: FixCandidate, action: str, outcome: str, message: str
+    candidate: FixCandidate, action: str, outcome: str, message: str, actor_id: str
 ) -> FixCandidate:
-    event = {"action": action, "outcome": outcome, "message": message}
+    event = {
+        "candidate_id": candidate.candidate_id,
+        "finding_ref": candidate.finding_ref,
+        "action": action,
+        "outcome": outcome,
+        "message": message,
+        "actor_id": str(actor_id or "unattributed")[:128],
+        "timestamp": time.time(),
+        "source_sha256": hashlib.sha256(candidate.original_code.encode("utf-8")).hexdigest(),
+        "verification_status": candidate.verification_status,
+    }
     return replace(candidate, approval_history=candidate.approval_history + (event,))
 
 

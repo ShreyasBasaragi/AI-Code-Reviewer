@@ -85,17 +85,29 @@ export type GitHubPRReview = {
   files_reviewed: number
   files_skipped: number
   files_failed: number
-  completion_status: 'complete' | 'partial' | 'failed' | 'no_supported_python' | 'empty_pr'
+  completion_status: 'complete' | 'partial' | 'failed' | 'no_supported_python' | 'empty_pr' | 'stale'
   pagination_truncated: boolean
   pagination_error: string | null
   findings_by_severity: Record<string, number>
   files: PRFileReview[]
+  repository_context?: {
+    status: string
+    revision?: string
+    files?: Array<{ path: string; revision?: string; bytes?: number; truncated?: boolean }>
+    warnings?: string[]
+    total_bytes?: number
+  }
+  head_repository?: string | null
+  head_branch?: string | null
+  stale?: boolean
+  stale_reason?: string | null
   action_policy?: {
     manual_pr_review: 'review_only'
     webhook_comment_publication: 'enabled' | 'disabled'
     autonomous_fix_preparation: 'enabled by administrator policy' | 'disabled'
-    autonomous_fixing: 'disabled'
-    commit_execution_enabled: 'true' | 'false'
+    autonomous_fixing: 'enabled' | 'disabled'
+    candidate_staging_enabled: 'true' | 'false'
+  commit_execution_enabled: 'true' | 'false'
     repository_source_sharing?: 'allowed' | 'blocked'
     source_sharing_authorization?: 'authorized' | 'not_authorized' | 'local_provider_no_external_sharing'
   }
@@ -106,21 +118,31 @@ export type GitHubActionRecord = {
   action_id: string
   finding_id: string
   action_type: 'review_comment' | 'autonomous_fix' | 'policy_decision'
-  publication_status: 'pending' | 'running' | 'published' | 'failed' | 'unknown' | 'skipped' | 'stale' | 'pending_required_verification' | 'denied' | 'AUTONOMOUS_COMMIT_DISABLED'
+  publication_status: string
   policy_decision: {
     action: string
     eligible: boolean
     status: string
     denial_reasons: string[]
     required_checks: string[]
+    comment_kind?: 'inline' | 'general'
   }
   github_comment_id: number | null
-  commit_sha: null
+  commit_sha: string | null
   lifecycle_state?: string
   verification_status?: string
   failure_code?: string | null
   head_sha?: string
   base_sha?: string
+  retry_available?: boolean
+  retry_after?: number | null
+  execution_evidence?: {
+    branch?: string
+    candidate?: { candidate_branch?: string; candidate_sha?: string }
+    ci?: { status?: string; candidate_sha?: string; workflow_identity?: string }
+    behavioral?: { status?: string; candidate_sha256?: string; test_identity?: string; attestation_verified?: boolean }
+    confidence?: { calibrated_confidence?: number; calibrated?: boolean; manifest_verified?: boolean }
+  }
 }
 
 export type GitHubWebhookActionStatus = {
@@ -188,6 +210,8 @@ export type ProviderConnectivity = {
 export type GitHubCredentialStatus = {
   github_token_configured: boolean | null
   github_actions_token_configured: boolean | null
+  github_candidate_staging_token_configured?: boolean | null
+  github_autonomous_commit_token_configured?: boolean | null
   webhook_secret_configured: boolean | null
   persistent_storage_available: boolean
   storage_mode: string
@@ -240,6 +264,39 @@ export type WebhookAdminStatus = {
   last_successful_delivery: Record<string, unknown> | null
   recent_deliveries: Array<Record<string, unknown>>
   delivery_authentication: string
+}
+
+export type AdminWebhookAction = {
+  action_id: string
+  action_type: string
+  publication_status: string
+  attempts: number
+  failure_code?: string | null
+  github_comment_id?: number | null
+  commit_sha?: string | null
+  verification_status?: string
+  lifecycle_state?: string
+  execution_evidence?: {
+    branch?: string
+    candidate?: { candidate_branch?: string; candidate_sha?: string }
+    ci?: { status?: string; candidate_sha?: string; workflow_identity?: string }
+    behavioral?: { status?: string; candidate_sha256?: string; test_identity?: string; attestation_verified?: boolean }
+    confidence?: { calibrated_confidence?: number; calibrated?: boolean; manifest_verified?: boolean }
+  }
+  retry_available?: boolean
+  retry_after?: number | null
+}
+
+export type AdminWebhookDelivery = {
+  delivery_id: string
+  repository?: string | null
+  pr_number?: number | null
+  status: string
+  failure_code?: string | null
+  attempts: number
+  next_attempt_at?: number | null
+  actions: AdminWebhookAction[]
+  retry_available?: boolean
 }
 
 export type SyntaxCheck = {

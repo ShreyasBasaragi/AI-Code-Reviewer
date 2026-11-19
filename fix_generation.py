@@ -71,9 +71,10 @@ class FixCandidate:
     verification_status: str = "not_checked"
     raw_response: str = ""
     approval_status: str = "pending"
-    approval_history: tuple[dict[str, str], ...] = ()
+    approval_history: tuple[dict[str, Any], ...] = ()
     verification_report: Optional[dict[str, Any]] = None
     provider_identity: Optional[str] = None
+    review_id: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

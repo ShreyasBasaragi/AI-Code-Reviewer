@@ -22,10 +22,14 @@ from mcp_server.github_pr import GitHubPRException
 logger = logging.getLogger(__name__)
 
 SUPPORTED_EVENT = "pull_request"
-SUPPORTED_ACTIONS = frozenset({"opened", "synchronize", "reopened", "ready_for_review"})
+SUPPORTED_ACTIONS = frozenset({"opened", "edited", "synchronize", "reopened", "ready_for_review"})
 _REPO_PART = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 _SHA = re.compile(r"^[0-9a-fA-F]{40,64}$")
 _SIGNATURE = re.compile(r"^sha256=[0-9a-fA-F]{64}$")
+_RETRYABLE_REVIEW_ERRORS = frozenset({
+    "github_timeout", "github_network_error", "github_rate_limited", "github_unavailable",
+})
+MAX_DELIVERY_ATTEMPTS = 3
 
 
 class WebhookError(Exception):
@@ -196,6 +200,8 @@ class WebhookDeliveryStore:
                 status TEXT NOT NULL,
                 failure_code TEXT,
                 result_json TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )""")
@@ -220,6 +226,8 @@ class WebhookDeliveryStore:
                 attempts INTEGER NOT NULL DEFAULT 0,
                 next_retry_at REAL,
                 operation_id TEXT,
+                last_operator TEXT,
+                last_manual_retry_at REAL,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 UNIQUE(delivery_id, finding_id, action_type)
@@ -228,6 +236,10 @@ class WebhookDeliveryStore:
             self._ensure_column(db, "github_action_records", "attempts", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(db, "github_action_records", "next_retry_at", "REAL")
             self._ensure_column(db, "github_action_records", "operation_id", "TEXT")
+            self._ensure_column(db, "github_action_records", "last_operator", "TEXT")
+            self._ensure_column(db, "github_action_records", "last_manual_retry_at", "REAL")
+            self._ensure_column(db, "github_webhook_deliveries", "attempts", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column(db, "github_webhook_deliveries", "next_attempt_at", "REAL")
             db.execute("CREATE INDEX IF NOT EXISTS idx_github_actions_delivery ON github_action_records(delivery_id, created_at)")
 
     @staticmethod
@@ -306,24 +318,29 @@ class WebhookDeliveryStore:
     def mark_skipped(self, delivery_id: str, code: str) -> None:
         self._set_status(delivery_id, "skipped", failure_code=code)
 
-    def claim_next(self) -> Optional[dict[str, Any]]:
+    def claim_next(self, *, now: Optional[float] = None) -> Optional[dict[str, Any]]:
         with self._lock, self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            current_time = time.time() if now is None else float(now)
             row = db.execute(
-                "SELECT * FROM github_webhook_deliveries WHERE status='pending' ORDER BY created_at, delivery_id LIMIT 1"
+                "SELECT * FROM github_webhook_deliveries WHERE status='pending' "
+                "AND (next_attempt_at IS NULL OR next_attempt_at<=?) "
+                "ORDER BY created_at, delivery_id LIMIT 1", (current_time,)
             ).fetchone()
             if row is None:
                 db.execute("COMMIT")
                 return None
             updated = db.execute(
-                "UPDATE github_webhook_deliveries SET status='running', updated_at=? WHERE delivery_id=? AND status='pending'",
-                (time.time(), row["delivery_id"]),
+                "UPDATE github_webhook_deliveries SET status='running',attempts=attempts+1,updated_at=? "
+                "WHERE delivery_id=? AND status='pending' AND (next_attempt_at IS NULL OR next_attempt_at<=?)",
+                (current_time, row["delivery_id"], current_time),
             ).rowcount
             db.execute("COMMIT")
             if not updated:
                 return None
             result = dict(row)
             result["status"] = "running"
+            result["attempts"] = row["attempts"] + 1
             return result
 
     def complete(self, delivery_id: str, status: str, result: dict[str, Any]) -> None:
@@ -334,15 +351,67 @@ class WebhookDeliveryStore:
             raise ValueError("webhook_result_exceeds_storage_limit")
         self._set_status(delivery_id, status, result_json=payload)
 
-    def fail(self, delivery_id: str, code: str) -> None:
+    def fail(self, delivery_id: str, code: str, *, retryable: bool = False,
+             max_attempts: int = MAX_DELIVERY_ATTEMPTS,
+             now: Optional[float] = None) -> tuple[str, Optional[float]]:
         safe_code = code if re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", code or "") else "webhook_processing_failed"
-        self._set_status(delivery_id, "failed", failure_code=safe_code)
+        current_time = time.time() if now is None else float(now)
+        with self._lock, self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT attempts FROM github_webhook_deliveries WHERE delivery_id=?",
+                             (delivery_id,)).fetchone()
+            attempts = row["attempts"] if row else MAX_DELIVERY_ATTEMPTS
+            if retryable and attempts < min(max_attempts, MAX_DELIVERY_ATTEMPTS):
+                delay = min(2 ** max(attempts - 1, 0), 60)
+                run_at = current_time + delay
+                status = "pending"
+                db.execute("UPDATE github_webhook_deliveries SET status=?,failure_code=?,next_attempt_at=?,updated_at=? WHERE delivery_id=?",
+                           (status, safe_code, run_at, current_time, delivery_id))
+            else:
+                run_at = None
+                status = "dead_letter" if retryable and attempts >= min(max_attempts, MAX_DELIVERY_ATTEMPTS) else "failed"
+                db.execute("UPDATE github_webhook_deliveries SET status=?,failure_code=?,next_attempt_at=NULL,updated_at=? WHERE delivery_id=?",
+                           (status, safe_code, current_time, delivery_id))
+            db.execute("COMMIT")
+            return status, run_at
+
+    def schedule_delivery_retry(self, delivery_id: str, *, now: Optional[float] = None,
+                                max_attempts: int = MAX_DELIVERY_ATTEMPTS) -> tuple[bool, Optional[float], str]:
+        """Admin-triggered bounded replay only when no GitHub action was started."""
+        current_time = time.time() if now is None else float(now)
+        with self._lock, self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,failure_code,attempts FROM github_webhook_deliveries WHERE delivery_id=?",
+                             (delivery_id,)).fetchone()
+            if row is None:
+                db.execute("COMMIT")
+                return False, None, "delivery_not_found"
+            action_count = db.execute("SELECT COUNT(*) FROM github_action_records WHERE delivery_id=?",
+                                      (delivery_id,)).fetchone()[0]
+            if action_count:
+                db.execute("COMMIT")
+                return False, None, "delivery_has_actions_reconcile_before_retry"
+            if row["status"] not in {"failed", "dead_letter"}:
+                db.execute("COMMIT")
+                return False, None, "delivery_not_retryable_state"
+            if row["failure_code"] not in _RETRYABLE_REVIEW_ERRORS | {"worker_interrupted_unknown_completion"}:
+                db.execute("COMMIT")
+                return False, None, "delivery_failure_not_retryable"
+            if row["attempts"] >= min(max_attempts, MAX_DELIVERY_ATTEMPTS):
+                db.execute("COMMIT")
+                return False, None, "delivery_retry_limit_reached"
+            delay = min(2 ** max(row["attempts"] - 1, 0), 60)
+            run_at = current_time + delay
+            db.execute("UPDATE github_webhook_deliveries SET status='pending',next_attempt_at=?,updated_at=? WHERE delivery_id=?",
+                       (run_at, current_time, delivery_id))
+            db.execute("COMMIT")
+            return True, run_at, "retry_scheduled"
 
     def _set_status(self, delivery_id: str, status: str, *, failure_code: Optional[str] = None,
                     result_json: Optional[str] = None) -> None:
         with self._lock, self._connection() as db:
             db.execute(
-                "UPDATE github_webhook_deliveries SET status=?, failure_code=?, result_json=?, updated_at=? WHERE delivery_id=?",
+                "UPDATE github_webhook_deliveries SET status=?, failure_code=?, result_json=?, next_attempt_at=NULL, updated_at=? WHERE delivery_id=?",
                 (status, failure_code, result_json, time.time(), delivery_id),
             )
 
@@ -385,6 +454,14 @@ class WebhookDeliveryStore:
         now = time.time()
         with self._lock, self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            # Deduplicate the semantic candidate across distinct webhook
+            # deliveries for the same PR head/finding. This transaction-level
+            # lookup closes the duplicate-delivery race without another ledger.
+            existing = db.execute("SELECT action_id FROM github_action_records WHERE repository=? AND pr_number=? AND head_sha=? AND finding_id=? AND action_type=? ORDER BY created_at LIMIT 1",
+                                  (repository, pr_number, head_sha, finding_id, action_type)).fetchone()
+            if existing is not None:
+                db.execute("COMMIT")
+                return False, existing["action_id"]
             inserted = db.execute("""INSERT OR IGNORE INTO github_action_records
                 (action_id,delivery_id,repository,pr_number,base_sha,head_sha,finding_id,action_type,
                  policy_json,candidate_id,verification_status,publication_status,failure_code,lifecycle_state,operation_id,created_at,updated_at)
@@ -421,12 +498,40 @@ class WebhookDeliveryStore:
         safe_code = failure_code if re.fullmatch(r"[a-zA-Z0-9_.-]{1,100}", failure_code or "") else None
         with self._lock, self._connection() as db:
             db.execute("""UPDATE github_action_records SET publication_status=?,lifecycle_state=?,github_comment_id=?,commit_sha=?,
-                failure_code=?,verification_status=COALESCE(?,verification_status),updated_at=? WHERE action_id=?""",
+                failure_code=?,next_retry_at=NULL,verification_status=COALESCE(?,verification_status),updated_at=? WHERE action_id=?""",
                 (status, _lifecycle_for(status), github_comment_id, commit_sha, safe_code,
                  verification_status, time.time(), action_id))
 
+    def update_action_details(self, action_id: str, *, candidate_id: Optional[str] = None,
+                              verification_status: Optional[str] = None,
+                              details: Optional[dict[str, Any]] = None) -> None:
+        """Persist bounded verification provenance in the existing action row."""
+        with self._lock, self._connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT policy_json FROM github_action_records WHERE action_id=?",
+                             (action_id,)).fetchone()
+            if row is None:
+                db.execute("ROLLBACK")
+                raise ValueError("webhook_action_not_found")
+            try:
+                policy = json.loads(row["policy_json"])
+            except json.JSONDecodeError:
+                policy = {"status": "unavailable"}
+            encoded_details = json.dumps(details or {}, ensure_ascii=False, separators=(",", ":"))
+            if len(encoded_details.encode("utf-8")) > 64 * 1024:
+                db.execute("ROLLBACK")
+                raise ValueError("webhook_action_details_too_large")
+            policy["execution_evidence"] = details or {}
+            db.execute("UPDATE github_action_records SET candidate_id=COALESCE(?,candidate_id),"
+                       "verification_status=COALESCE(?,verification_status),policy_json=?,updated_at=? WHERE action_id=?",
+                       (candidate_id, verification_status,
+                        json.dumps(policy, ensure_ascii=False, separators=(",", ":")),
+                        time.time(), action_id))
+            db.execute("COMMIT")
+
     def schedule_action_retry(self, action_id: str, *, retryable: bool,
-                              max_attempts: int = 3) -> tuple[bool, Optional[float]]:
+                              max_attempts: int = 3, actor_id: Optional[str] = None,
+                              now: Optional[float] = None) -> tuple[bool, Optional[float]]:
         """Schedule bounded retries only for known failures; ambiguity never retries."""
         if not retryable:
             return False, None
@@ -438,10 +543,11 @@ class WebhookDeliveryStore:
                     or row["attempts"] >= min(max_attempts, 3)):
                 db.execute("COMMIT")
                 return False, None
+            current_time = time.time() if now is None else float(now)
             delay = min(2 ** max(row["attempts"] - 1, 0), 60)
-            run_at = time.time() + delay
-            db.execute("UPDATE github_action_records SET publication_status='pending',lifecycle_state='pending',next_retry_at=?,updated_at=? WHERE action_id=?",
-                       (run_at, time.time(), action_id))
+            run_at = current_time + delay
+            db.execute("UPDATE github_action_records SET publication_status='pending',lifecycle_state='pending',next_retry_at=?,last_operator=?,last_manual_retry_at=?,updated_at=? WHERE action_id=?",
+                       (run_at, str(actor_id or "unattributed")[:128], current_time, current_time, action_id))
             db.execute("COMMIT")
             return True, run_at
 
@@ -452,6 +558,13 @@ class WebhookDeliveryStore:
             raise ValueError("reconciliation_status_invalid")
         self.finish_action(action_id, status, github_comment_id=github_comment_id,
                            failure_code=failure_code)
+
+    def mark_commit_reconciled(self, action_id: str, *, status: str,
+                               commit_sha: Optional[str] = None,
+                               failure_code: Optional[str] = "commit_remote_state_reconciled") -> None:
+        if status not in {"published", "failed", "stale", "unknown"}:
+            raise ValueError("commit_reconciliation_status_invalid")
+        self.finish_action(action_id, status, commit_sha=commit_sha, failure_code=failure_code)
 
     def transition_action(self, action_id: str, target_state: str, *,
                           verification_status: Optional[str] = None,
@@ -505,11 +618,35 @@ class WebhookDeliveryStore:
             result.append(item)
         return result
 
+    def is_codementor_commit(self, repository: str, commit_sha: str) -> bool:
+        """Identify a previously confirmed action commit for webhook suppression."""
+        if not isinstance(repository, str) or not isinstance(commit_sha, str):
+            return False
+        with self._lock, self._connection() as db:
+            rows = db.execute("SELECT commit_sha,policy_json FROM github_action_records WHERE repository=? AND action_type='autonomous_fix'",
+                              (repository,)).fetchall()
+        for row in rows:
+            if row["commit_sha"] == commit_sha:
+                return True
+            try:
+                policy = json.loads(row["policy_json"])
+            except json.JSONDecodeError:
+                continue
+            evidence = policy.get("execution_evidence") if isinstance(policy, dict) else None
+            candidate = evidence.get("candidate") if isinstance(evidence, dict) else None
+            if (isinstance(evidence, dict) and evidence.get("commit_attempted") is True
+                    and isinstance(candidate, dict) and candidate.get("candidate_sha") == commit_sha):
+                # The reservation and candidate SHA are durable before the
+                # final PATCH. Suppress a synchronize event that races ahead
+                # of the action's success response/commit_sha write.
+                return True
+        return False
+
     def list_recent(self, *, limit: int = 20) -> list[dict[str, Any]]:
         """Return bounded delivery metadata without source payloads or tokens."""
         with self._lock, self._connection() as db:
             rows = db.execute("""SELECT delivery_id,event,action,owner,owner || '/' || repository AS repository,pr_number,
-                base_sha,head_sha,status,failure_code,created_at,updated_at
+                base_sha,head_sha,status,failure_code,attempts,next_attempt_at,created_at,updated_at
                 FROM github_webhook_deliveries ORDER BY created_at DESC LIMIT ?""",
                 (max(1, min(limit, 50)),)).fetchall()
         return [dict(row) for row in rows]

@@ -72,6 +72,42 @@ def test_inline_comment_uses_validated_new_side_location_and_provenance():
     assert read.calls == 1
 
 
+def test_non_inline_finding_uses_revision_checked_general_issue_comment():
+    read = ReadClient()
+    requests = []
+    adapter = GitHubMCPActionAdapter(
+        read_client=read, token="write-token",
+        transport=lambda method, url, headers, body: (
+            requests.append((method, url, json.loads(body))) or {"id": 1235}
+        ),
+    )
+    result = adapter.publish_general_comment(
+        REF, repository="acme/demo", expected_head_sha=SHA,
+        finding=valid_finding(inline_supported=False), operation_id="d" * 32,
+    )
+    assert result.status == "published" and result.github_id == 1235
+    assert result.detail["comment_kind"] == "general"
+    method, url, payload = requests[0]
+    assert method == "POST" and url.endswith("/repos/acme/demo/issues/17/comments")
+    assert "AI Code Reviewer (AI/RAG)" in payload["body"]
+    assert "ai-code-review-action:" + "d" * 32 in payload["body"]
+    assert read.calls == 1
+
+
+def test_general_comment_refuses_stale_revision_without_write():
+    requests = []
+    adapter = GitHubMCPActionAdapter(
+        read_client=ReadClient(sha="b" * 40), token="write-token",
+        transport=lambda *args: requests.append(args),
+    )
+    result = adapter.publish_general_comment(
+        REF, repository="acme/demo", expected_head_sha=SHA,
+        finding=valid_finding(inline_supported=False),
+    )
+    assert result.status == "stale"
+    assert requests == []
+
+
 def test_ambiguous_comment_reconciliation_uses_operation_id_and_expected_sha():
     operation_id = "c" * 32
     marker = f"<!-- ai-code-review-action:{operation_id} -->"
@@ -92,6 +128,24 @@ def test_ambiguous_comment_reconciliation_uses_operation_id_and_expected_sha():
         REF, repository="acme/demo", expected_head_sha=SHA, operation_id=operation_id,
     )
     assert absent["status"] == "not_published" and absent["retry_safe"] is True
+
+
+def test_general_comment_reconciliation_uses_issue_comment_endpoint_and_operation_marker():
+    operation_id = "e" * 32
+    marker = f"<!-- ai-code-review-action:{operation_id} -->"
+    requests = []
+
+    def transport(method, url, headers, body):
+        requests.append((method, url))
+        return [{"id": 34, "body": marker}]
+
+    adapter = GitHubMCPActionAdapter(read_client=ReadClient(), token="action-token", transport=transport)
+    result = adapter.reconcile_inline_comment(
+        REF, repository="acme/demo", expected_head_sha=SHA,
+        operation_id=operation_id, comment_kind="general",
+    )
+    assert result["status"] == "published" and result["github_comment_id"] == 34
+    assert requests[0][1].startswith("https://api.github.com/repos/acme/demo/issues/17/comments?")
 
 
 @pytest.mark.parametrize("changes", [
@@ -157,7 +211,7 @@ def test_fix_preparation_enforces_path_size_syntax_static_and_revision_without_w
     )
     assert prepared["status"] == "PENDING_REQUIRED_VERIFICATION"
     assert prepared["behavioral_status"] == "not_run" and prepared["ci_status"] == "not_run"
-    assert prepared["commit_execution"] == "AUTONOMOUS_COMMIT_DISABLED"
+    assert prepared["commit_execution"] == "requires_independent_runtime_gates"
     assert prepared["changed_lines"] == 2
     read.source = "a=1\nb=2\nc=3\n"
     too_large = adapter.prepare_change(
@@ -186,7 +240,7 @@ def test_fix_preparation_enforces_path_size_syntax_static_and_revision_without_w
     assert writes == []
 
 
-def test_commit_preparation_checks_branch_identity_but_execution_is_always_disabled():
+def test_commit_preparation_checks_branch_identity_and_default_runtime_gate_is_closed():
     read = ReadClient()
     calls = []
     adapter = GitHubMCPActionAdapter(read_client=read, token="t", transport=lambda *args: calls.append(args))
@@ -196,7 +250,7 @@ def test_commit_preparation_checks_branch_identity_but_execution_is_always_disab
     )
     assert plan["status"] == "AUTONOMOUS_COMMIT_DISABLED"
     assert plan["commit_sha"] is None and plan["force_push"] is False
-    assert "autonomous_commit_execution_disabled_in_j2" in plan["denial_reasons"]
+    assert "explicit_runtime_commit_authorization_required" in plan["denial_reasons"]
     result = adapter.execute_commit()
     assert result.status == "AUTONOMOUS_COMMIT_DISABLED" and calls == []
     wrong_branch = adapter.prepare_commit(
@@ -227,7 +281,7 @@ def test_existing_fix_candidate_must_pass_existing_verifier_before_patch_prepara
     assert result["verification"]["syntax_check"]["status"] == "passed"
     assert result["verification"]["static_analysis_status"] == "passed"
     assert result["behavioral_status"] == "not_run" and result["ci_status"] == "not_run"
-    assert result["commit_execution"] == "AUTONOMOUS_COMMIT_DISABLED"
+    assert result["commit_execution"] == "requires_independent_runtime_gates"
     denied = adapter.prepare_fix_candidate(
         REF, repository="acme/demo", expected_head_sha=SHA, file_path="src/app.py",
         candidate=candidate, allowed_paths={"src/app.py"},
@@ -262,6 +316,37 @@ def test_action_ledger_prevents_duplicate_comment_publication_and_records_outcom
     assert records[0]["publication_status"] == "published"
     assert records[0]["github_comment_id"] == 7
     assert records[0]["commit_sha"] is None
+
+
+def test_coordinator_routes_unmappable_findings_to_one_policy_gated_general_comment(tmp_path):
+    store = WebhookDeliveryStore(tmp_path / "general-actions.sqlite3")
+    store.initialize()
+    requests = []
+    adapter = GitHubMCPActionAdapter(
+        read_client=ReadClient(), token="write-token",
+        transport=lambda method, url, headers, body: (
+            requests.append((method, url, json.loads(body))) or {"id": 99}
+        ),
+    )
+    coordinator = GitHubActionCoordinator(
+        store, read_client=adapter.read_client, adapter=adapter,
+        configs={"acme/demo": RepositoryActionConfig(publish_review_comments=True)},
+    )
+    event = {"delivery_id": "delivery-general", "owner": "acme", "repository": "demo", "number": 17,
+             "base_sha": SHA, "head_sha": SHA}
+    finding = valid_finding(inline_supported=False, source_line=None, line_start=None, line_end=None)
+    review = {"repository": "acme/demo", "head_sha": SHA, "head_repository": "acme/demo",
+              "head_branch": "feature", "files": [{"path": "src/app.py", "status": "modified",
+              "evidence": [{"evidence_id": "rag-1"}], "findings": [finding]}]}
+
+    first = coordinator.process_review(event, review)
+    second = coordinator.process_review(event, review)
+    assert first["actions"][0]["status"] == "published"
+    assert second["actions"][0]["status"] == "duplicate_suppressed"
+    assert len(requests) == 1 and requests[0][1].endswith("/issues/17/comments")
+    record = store.get_actions("delivery-general")[0]
+    assert record["policy_decision"]["comment_kind"] == "general"
+    assert record["github_comment_id"] == 99
 
 
 def test_ambiguous_comment_write_is_recorded_unknown_and_never_retried(tmp_path):

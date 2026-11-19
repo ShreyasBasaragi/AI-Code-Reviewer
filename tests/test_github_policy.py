@@ -125,7 +125,8 @@ def test_missing_repo_configuration_defaults_to_no_automated_write():
     decision = evaluate_finding({}, good_input())
     assert not decision.eligible
     assert decision.action == "human_review"
-    assert "review_comment_publication_not_authorized" in decision.denial_reasons
+    assert "repository_autonomous_fix_opt_in_disabled" in decision.denial_reasons
+    assert "review_comment_publication_not_authorized" not in decision.denial_reasons
 
 
 def test_admin_configuration_is_strict_and_cannot_remove_behavioral_or_ci_gates(tmp_path):

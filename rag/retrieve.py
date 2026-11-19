@@ -140,7 +140,7 @@ def _evidence_from_query_results(results, query_index: int = 0) -> list[Retrieve
     return evidence
 
 
-def _retrieve_evidence_v2(code: str) -> list[RetrievedEvidence]:
+def _retrieve_evidence_v2(code: str, *, strict: bool = False) -> list[RetrievedEvidence]:
     """Return structured evidence from the existing v2 collection only.
 
     This function is read-only, uses the configured collection, and does not create
@@ -151,12 +151,22 @@ def _retrieve_evidence_v2(code: str) -> list[RetrievedEvidence]:
         return []
     collection = _get_collection()
     if collection is None:
+        if strict:
+            from rag.retrieve_v3 import RAGConfigurationError
+
+            raise RAGConfigurationError(
+                "v2 Chroma collection is unavailable; check the configured database and retrieval warning"
+            )
         return []
 
     try:
         count = collection.count()
         if count == 0:
             logger.warning("RAG collection '%s' is empty.", COLLECTION_NAME)
+            if strict:
+                from rag.retrieve_v3 import RAGConfigurationError
+
+                raise RAGConfigurationError(f"v2 Chroma collection {COLLECTION_NAME!r} is empty")
             return []
 
         clean_code = code.strip()
@@ -188,6 +198,14 @@ def _retrieve_evidence_v2(code: str) -> list[RetrievedEvidence]:
             "Structured context retrieval encountered an error (%s).",
             type(exc).__name__,
         )
+        if strict:
+            from rag.retrieve_v3 import RAGConfigurationError
+
+            if isinstance(exc, RAGConfigurationError):
+                raise
+            raise RAGConfigurationError(
+                f"v2 Chroma retrieval failed: {type(exc).__name__}"
+            ) from exc
         return []
 
 
@@ -227,9 +245,19 @@ def retrieve_evidence_with_diagnostics(
         )
         return retriever.retrieve_with_diagnostics(code, language=language, file_path=file_path)
     started = time.perf_counter()
-    evidence = _retrieve_evidence_v2(code)
+    try:
+        evidence = _retrieve_evidence_v2(code, strict=True)
+    except Exception as exc:
+        return [], {
+            "corpus_version": "v2", "strategy": "v2_baseline",
+            "status": "errored", "error_type": type(exc).__name__,
+            "selected_count": 0, "candidate_count": 0,
+            "source_distribution": {}, "language_distribution": {},
+            "retrieval_seconds": time.perf_counter() - started,
+        }
     diagnostics = {
         "corpus_version": "v2", "strategy": "v2_baseline",
+        "status": "passed",
         "selected_count": len(evidence),
         "candidate_count": len(evidence),
         "source_distribution": {}, "language_distribution": {},
@@ -243,7 +271,8 @@ def retrieve_context(code: str) -> list[str]:
     """Backward-compatible text-only retrieval interface."""
     contexts = []
     seen = set()
-    for item in retrieve_evidence(code):
+    evidence = retrieve_evidence(code)
+    for item in evidence:
         if item.text not in seen:
             seen.add(item.text)
             contexts.append(item.text)

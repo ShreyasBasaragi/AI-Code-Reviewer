@@ -121,10 +121,14 @@ def test_recovery_credential_cannot_be_consumed_concurrently(tmp_path):
 
 def test_startup_prints_configured_urls_recovery_and_bootstrap_only_once(tmp_path, monkeypatch, capsys):
     from mcp_server.credential_store import CredentialStore
+    from mcp_server.lifecycle_store import SQLiteLifecycleStore
+    from mcp_server.state import PROCESS_STATE
 
     monkeypatch.setenv("AI_CODE_REVIEWER_API_URL", "http://127.0.0.1:9123")
     monkeypatch.setenv("AI_CODE_REVIEWER_FRONTEND_URL", "http://localhost:4173")
     monkeypatch.setenv("AI_CODE_REVIEWER_WEBHOOK_DB_PATH", str(tmp_path / "webhooks.sqlite3"))
+    monkeypatch.setattr(PROCESS_STATE, "persistence_store",
+                        SQLiteLifecycleStore(tmp_path / "lifecycle.sqlite3"))
     auth = AdminAuthStore(tmp_path / "admin.sqlite3")
     app = create_app(admin_auth=auth, credentials=CredentialStore(FakeKeychain()))
     with TestClient(app):
@@ -139,6 +143,18 @@ def test_startup_prints_configured_urls_recovery_and_bootstrap_only_once(tmp_pat
     assert "Authentication: Setup required" in second
     assert "reset-bootstrap" in second
     assert bootstrap not in second
+
+
+def test_bootstrap_credential_can_be_withheld_from_deployment_logs(tmp_path, monkeypatch, capsys):
+    from mcp_server.http_api import _print_startup_summary
+
+    auth = AdminAuthStore(tmp_path / "auth.sqlite3")
+    bootstrap = auth.startup()
+    monkeypatch.setenv("AI_CODE_REVIEWER_PRINT_BOOTSTRAP_CREDENTIAL", "false")
+    _print_startup_summary(auth, CredentialStore(FakeKeychain()), bootstrap)
+    output = capsys.readouterr().out
+    assert "Bootstrap credential withheld from logs" in output
+    assert bootstrap not in output
 
 
 def test_setup_login_logout_and_csrf_use_cookie_session(tmp_path, monkeypatch):

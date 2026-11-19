@@ -54,7 +54,7 @@ def make_client(tmp_path, monkeypatch):
     keychain = FakeKeychain()
     credentials = CredentialStore(keychain)
     client = TestClient(create_app(admin_auth=auth, credentials=credentials))
-    client.cookies.set("acr_admin_session", token, path="/api/admin")
+    client.cookies.set("acr_admin_session", token, path="/")
     return client, auth, credentials, {"Origin": "http://127.0.0.1:5173"}
 
 
@@ -113,7 +113,7 @@ def test_repository_discovery_and_policy_update_use_validated_canonical_policy(t
               "required_github_checks": ["build"]}
     saved = client.put("/api/admin/github/repositories/acme/service/policy", headers=headers, json=update)
     assert saved.status_code == 200 and saved.json()["policy"]["allow_source_sharing"] is True
-    assert saved.json()["autonomous_commits"] == "unavailable_disabled_hard_gate"
+    assert saved.json()["autonomous_commits"] == "implemented_off_by_default_requires_independent_gates"
     assert client.get("/api/admin/github/repositories/acme/service/policy").json()["policy"]["publish_review_comments"] is False
     update["revision"] = initial["revision"]
     conflict = client.put("/api/admin/github/repositories/acme/service/policy", headers=headers, json=update)

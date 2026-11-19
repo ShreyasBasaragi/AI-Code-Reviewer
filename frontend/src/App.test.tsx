@@ -155,6 +155,8 @@ describe('AI Code Reviewer workflow', () => {
     expect(container.textContent).toContain('Static Analysis · PYSEC001')
     expect(container.textContent).toContain('Provider/model: groq:openai/gpt-oss-20b')
     expect(container.textContent).toContain('valid new-side location')
+    expect(container.textContent).toContain('Review generated · not published')
+    expect(container.textContent).toContain('Autonomous fixing and commit execution are disabled.')
     const submission = requests.find(([url]) => url.endsWith('/api/github/pr-reviews'))
     expect(submission?.[1]?.method).toBe('POST')
     expect(submission?.[1]?.body).toBe(JSON.stringify({ url: 'https://github.com/acme/repo/pull/7' }))
@@ -164,7 +166,8 @@ describe('AI Code Reviewer workflow', () => {
     const prCalls: string[] = []
     installApiMock((url) => {
       if (url.endsWith('/api/health')) return jsonResponse({ status: 'ready' })
-      prCalls.push(url)
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: false, expires_in_seconds: 0, setup_required: false, legacy_token_available: false })
+      if (url.includes('/api/github/')) prCalls.push(url)
       throw new Error('PR endpoint should not be called')
     })
     const container = mount()
@@ -268,6 +271,7 @@ describe('AI Code Reviewer workflow', () => {
         secret_configured: false, required_events: ['pull_request'], public_reachability: 'localhost_only',
         last_authenticated_delivery: null, last_successful_delivery: null, recent_deliveries: [],
         delivery_authentication: 'HMAC SHA-256 signature required' })
+      if (url.endsWith('/api/admin/webhook/deliveries?limit=25')) return jsonResponse({ deliveries: [] })
       if (url.endsWith('/api/admin/github/test')) return jsonResponse({ status: 'passed', account: { login: 'review-admin', id: 7, scopes: 'repo', accepted_permissions: '' } })
       throw new Error(`Unexpected request ${url}`)
     })
@@ -324,6 +328,7 @@ describe('AI Code Reviewer workflow', () => {
     await click(button(container, /Possible missing guard/))
     const selected = [...container.querySelectorAll('.finding-row')].find((row) => row.textContent?.includes('Possible missing guard'))
     expect(selected?.className).toContain('selected')
+    expect(container.textContent).toContain('Source location unavailable')
   })
 
   it('generates a fix only after the finding action and shows the returned candidate', async () => {
@@ -341,6 +346,7 @@ describe('AI Code Reviewer workflow', () => {
     const firstCall = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/findings/finding-1/fixes'))
     expect(firstCall).toHaveLength(1)
     expect(JSON.parse(String(firstCall[0][1]?.body))).toEqual({ language: 'python' })
+    expect(firstCall[0][1]?.credentials).toBe('include')
     await click(button(container, /Generate fix candidate/))
     const fixCalls = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/findings/finding-1/fixes'))
     expect(fixCalls).toHaveLength(2)
@@ -448,7 +454,7 @@ describe('AI Code Reviewer workflow', () => {
     const container = mount()
     await submitSource(container)
     await click(button(container, /Generate fix candidate/))
-    expect(container.textContent).toContain('This review or fix has expired.')
+    expect(container.textContent).toContain('This review was not found or has expired.')
   })
 
   it('clears a stale review and candidate when source text changes', async () => {
@@ -470,5 +476,257 @@ describe('AI Code Reviewer workflow', () => {
     expect(container.textContent).not.toContain(candidateId)
     expect(container.textContent).not.toContain('Review summary')
     expect(container.textContent).toContain('previous review and candidate were cleared')
+  })
+
+  it('shows a clean review and location fallback without assuming optional provider fields', async () => {
+    const cleanReview = { valid: true, summary: 'No actionable issues found.', findings: [], evidence: [], processing_errors: [], static_analysis_status: 'passed' }
+    installApiMock((url) => url.endsWith('/api/health') ? jsonResponse({ status: 'ready' })
+      : url.endsWith('/api/reviews') ? jsonResponse({ review_id: reviewId, review: cleanReview }, 201)
+        : jsonResponse({ authenticated: false, expires_in_seconds: 0, setup_required: false, legacy_token_available: false }))
+    const container = mount()
+    await submitSource(container)
+    expect(container.textContent).toContain('No findings returned')
+    expect(container.textContent).toContain('No actionable issues found.')
+    expect(container.textContent).toContain('Provider/model: not reported')
+  })
+
+  it('does not overwrite a newer editor state with a stale review response or submit twice', async () => {
+    let resolveReview: ((value: Response) => void) | undefined
+    let reviewCalls = 0
+    installApiMock((url) => {
+      if (url.endsWith('/api/health')) return jsonResponse({ status: 'ready' })
+      if (url.endsWith('/api/reviews')) {
+        reviewCalls += 1
+        return new Promise<Response>((resolve) => { resolveReview = resolve })
+      }
+      return jsonResponse({ authenticated: true, expires_in_seconds: 900, setup_required: false, legacy_token_available: false })
+    })
+    const container = mount()
+    const editor = container.querySelector('[aria-label="Python source"]') as HTMLTextAreaElement
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
+      setter?.call(editor, source)
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    const reviewButton = button(container, /Review code/)
+    await click(reviewButton)
+    await click(reviewButton)
+    expect(reviewCalls).toBe(1)
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set
+      setter?.call(editor, 'def newer():\n    return 3\n')
+      editor.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await act(async () => resolveReview?.(jsonResponse({ review_id: reviewId, review }, 201) as Response))
+    expect(container.textContent).not.toContain('One correctness issue is supported')
+    expect((container.querySelector('[aria-label="Python source"]') as HTMLTextAreaElement).value).toContain('return 3')
+  })
+
+  it('does not show a candidate response for a finding that is no longer selected', async () => {
+    let resolveFix: ((value: Response) => void) | undefined
+    installApiMock((url) => {
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: true, expires_in_seconds: 900, setup_required: false, legacy_token_available: false })
+      if (url.endsWith('/api/health')) return jsonResponse({ status: 'ready' })
+      if (url.endsWith('/api/reviews')) return jsonResponse({ review_id: reviewId, review }, 201)
+      if (url.includes('/findings/finding-1/fixes')) return new Promise<Response>((resolve) => { resolveFix = resolve })
+      throw new Error(`Unexpected request ${url}`)
+    })
+    const container = mount()
+    await submitSource(container)
+    await click(button(container, /Generate fix candidate/))
+    await click(button(container, /Possible missing guard/))
+    await act(async () => resolveFix?.(jsonResponse(candidate, 201) as Response))
+    expect(container.textContent).not.toContain(candidateId)
+    expect(container.querySelector('.selected-finding h3')?.textContent).toContain('Possible missing guard')
+  })
+
+  it('recovers a persisted review using the authenticated API without restoring source into browser storage', async () => {
+    const requests: Array<[string, RequestInit | undefined]> = []
+    installApiMock((url, init) => {
+      requests.push([url, init])
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: true, expires_in_seconds: 900, setup_required: false, legacy_token_available: false })
+      if (url.endsWith(`/api/reviews/${reviewId}`)) return jsonResponse({ review_id: reviewId, review })
+      return jsonResponse({ status: 'ready' })
+    })
+    const container = mount()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    const idInput = container.querySelector('#recover-review-id') as HTMLInputElement
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(idInput, reviewId)
+      idInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await click(button(container, 'Recover review'))
+    expect(container.textContent).toContain('Persisted review recovered')
+    expect(container.textContent).toContain(reviewId)
+    expect(container.textContent).toContain('Unexpected return value')
+    const recovery = requests.find(([url]) => url.endsWith(`/api/reviews/${reviewId}`))
+    expect(recovery?.[1]?.credentials).toBe('include')
+    expect(window.localStorage?.length ?? 0).toBe(0)
+    expect(window.sessionStorage?.length ?? 0).toBe(0)
+  })
+
+  it('recovers a stored candidate as unverified and requires fresh verification before export', async () => {
+    const stored = { ...candidate, approval_status: 'accepted', verification_report: verification }
+    installApiMock((url) => {
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: true, expires_in_seconds: 900, setup_required: false, legacy_token_available: false })
+      if (url.endsWith(`/api/fixes/${candidateId}`)) return jsonResponse(stored)
+      if (url.endsWith('/verify')) return jsonResponse(verification)
+      return jsonResponse({ status: 'ready' })
+    })
+    const container = mount()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    const idInput = container.querySelector('#recover-candidate-id') as HTMLInputElement
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(idInput, candidateId)
+      idInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await click(button(container, 'Recover candidate'))
+    expect(container.textContent).toContain('Candidate recovered with stored approval state')
+    expect(container.textContent).toContain('not marked verified in the current session')
+    expect(button(container, /Export files/).disabled).toBe(true)
+    await click(button(container, 'Verify syntax & static analysis'))
+    expect(button(container, /Export files/).disabled).toBe(false)
+  })
+
+  it('reports an expired persisted candidate without treating it as verified', async () => {
+    installApiMock((url) => {
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: true, expires_in_seconds: 900, setup_required: false, legacy_token_available: false })
+      if (url.endsWith(`/api/fixes/${candidateId}`)) return jsonResponse({ detail: 'candidate_not_found_or_expired' }, 404)
+      return jsonResponse({ status: 'ready' })
+    })
+    const container = mount()
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    const idInput = container.querySelector('#recover-candidate-id') as HTMLInputElement
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(idInput, candidateId)
+      idInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await click(button(container, 'Recover candidate'))
+    expect(container.textContent).toContain('This candidate was not found or has expired.')
+    expect(container.textContent).not.toContain('Python syntax passed')
+  })
+
+  it('clears administrator state and shows a safe sign-in action when a fix endpoint returns 401', async () => {
+    installApiMock((url) => {
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: true, expires_in_seconds: 900, setup_required: false, legacy_token_available: false })
+      if (url.endsWith('/api/health')) return jsonResponse({ status: 'ready' })
+      if (url.endsWith('/api/reviews')) return jsonResponse({ review_id: reviewId, review }, 201)
+      if (url.includes('/findings/finding-1/fixes')) return jsonResponse({ detail: 'provider_settings_unauthorized' }, 401)
+      throw new Error(`Unexpected request ${url}`)
+    })
+    const container = mount()
+    await submitSource(container)
+    await click(button(container, /Generate fix candidate/))
+    expect(container.textContent).toContain('Administrator sign-in is required')
+    expect(button(container, 'Open AI Settings')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('provider_settings_unauthorized')
+  })
+
+  it('distinguishes published, skipped, blocked and unknown GitHub writes and offers reconciliation for ambiguity', async () => {
+    const actions = [
+      { action_id: 'published-1', finding_id: 'finding-1', action_type: 'review_comment', publication_status: 'published', policy_decision: { action: 'review_comment', eligible: true, status: 'allowed', denial_reasons: [], required_checks: [], comment_kind: 'inline' }, github_comment_id: 123, commit_sha: null },
+      { action_id: 'skipped-1', finding_id: 'finding-2', action_type: 'review_comment', publication_status: 'skipped', policy_decision: { action: 'review_comment', eligible: false, status: 'skipped', denial_reasons: [], required_checks: [] }, github_comment_id: null, commit_sha: null },
+      { action_id: 'blocked-1', finding_id: 'finding-3', action_type: 'review_comment', publication_status: 'denied', policy_decision: { action: 'review_comment', eligible: false, status: 'denied', denial_reasons: ['comments_disabled'], required_checks: [] }, github_comment_id: null, commit_sha: null },
+      { action_id: 'unknown-1', finding_id: 'finding-4', action_type: 'review_comment', publication_status: 'unknown', policy_decision: { action: 'review_comment', eligible: true, status: 'unknown', denial_reasons: [], required_checks: [] }, github_comment_id: null, commit_sha: null },
+    ]
+    installApiMock((url) => {
+      if (url.endsWith('/api/health')) return jsonResponse({ status: 'ready' })
+      if (url.endsWith('/api/github/webhook/deliveries/delivery-1/actions')) return jsonResponse({ delivery_id: 'delivery-1', status: 'completed', repository: 'acme/repo', pr_number: 7, actions })
+      if (url.endsWith('/api/github/webhook/deliveries/delivery-1/actions/unknown-1/reconcile')) return jsonResponse({ action_id: 'unknown-1', status: 'not_published', retry_safe: true })
+      throw new Error(`Unexpected request ${url}`)
+    })
+    const container = mount()
+    await click(button(container, 'GitHub pull request'))
+    const deliveryInput = container.querySelector('#webhook-delivery-id') as HTMLInputElement
+    const tokenInput = container.querySelector('#webhook-status-token') as HTMLInputElement
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(deliveryInput, 'delivery-1')
+      deliveryInput.dispatchEvent(new Event('input', { bubbles: true }))
+      setter?.call(tokenInput, 'status-token-never-persisted')
+      tokenInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await click(button(container, 'Check status'))
+    expect(container.textContent).toContain('Comment published (inline)')
+    expect(container.textContent).toContain('Comment skipped')
+    expect(container.textContent).toContain('Comment blocked by policy')
+    expect(container.textContent).toContain('Comment outcome unknown · reconciliation required')
+    expect(container.textContent).toContain('Autonomous fixing and commit execution are disabled.')
+    expect(document.body.textContent).not.toContain('status-token-never-persisted')
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(tokenInput, 'status-token-never-persisted')
+      tokenInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await click(button(container, 'Reconcile comment status'))
+    expect(container.textContent).toContain('No matching comment was found')
+    expect(document.body.textContent).not.toContain('status-token-never-persisted')
+  })
+
+  it('loads and saves Groq and Qwen provider choices independently without persisting secrets in the browser', async () => {
+    const settings = { review_provider: 'groq', fix_provider: 'qwen_local', groq_model: 'openai/gpt-oss-20b',
+      groq_api_key_configured: true, qwen_base_model: 'Qwen/Qwen2.5-Coder-3B-Instruct', qwen_adapter_path: '/approved/adapter',
+      qwen_quantization: 'none', review_temperature: 0.1, fix_temperature: 0.2, max_output_tokens: 1024,
+      source_sharing_consent: false, groq_connectivity: 'not_checked', qwen_readiness: 'adapter_artifacts_missing',
+      generation: 1, secret_storage: 'process_memory_only' }
+    const calls: Array<[string, RequestInit | undefined]> = []
+    installApiMock((url, init) => {
+      calls.push([url, init])
+      if (url.endsWith('/api/admin/session') && init?.method === 'POST') return jsonResponse({ authenticated: true, expires_in_seconds: 900 })
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: false, expires_in_seconds: 0, setup_required: false, legacy_token_available: false })
+      if (url.endsWith('/api/admin/provider-options')) return jsonResponse({ groq_models: [settings.groq_model],
+        groq_model_source: 'server_approved_structured_output_models', qwen_base_model: settings.qwen_base_model,
+        qwen_adapter_path: settings.qwen_adapter_path, qwen_quantization: ['none'],
+        review_providers: ['groq', 'qwen_local'], fix_providers: ['groq', 'qwen_local'], default_groq_model: settings.groq_model })
+      if (url.endsWith('/api/admin/provider-settings') && init?.method === 'PUT') return jsonResponse({ ...settings, review_provider: 'qwen_local', fix_provider: 'groq' })
+      if (url.endsWith('/api/admin/provider-settings')) return jsonResponse(settings)
+      return jsonResponse({ status: 'ready' })
+    })
+    const container = mount()
+    await click(button(container, /AI Settings/))
+    const password = container.querySelector('#admin-password') as HTMLInputElement
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(password, 'temporary-password')
+      password.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await click(button(container, 'Sign in'))
+    await act(async () => { await Promise.resolve(); await Promise.resolve() })
+    const selectors = container.querySelectorAll('select')
+    expect((selectors[0] as HTMLSelectElement).value).toBe('groq')
+    expect((selectors[1] as HTMLSelectElement).value).toBe('qwen_local')
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set
+      setter?.call(selectors[0], 'qwen_local')
+      selectors[0].dispatchEvent(new Event('change', { bubbles: true }))
+      setter?.call(selectors[1], 'groq')
+      selectors[1].dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    await click(button(container, 'Save settings'))
+    const saved = calls.find(([url, init]) => url.endsWith('/api/admin/provider-settings') && init?.method === 'PUT')
+    expect(saved?.[1]?.credentials).toBe('include')
+    expect(JSON.parse(String(saved?.[1]?.body))).toMatchObject({ review_provider: 'qwen_local', fix_provider: 'groq' })
+    expect(JSON.stringify(JSON.parse(String(saved?.[1]?.body)))).not.toContain('groq_api_key')
+    expect(container.textContent).toContain('does not silently switch providers')
+    expect(document.body.textContent).not.toContain('temporary-password')
+  })
+
+  it('treats a failed configured Qwen fix request as an error with no fallback request', async () => {
+    const fixCalls: string[] = []
+    installApiMock((url) => {
+      if (url.endsWith('/api/admin/session')) return jsonResponse({ authenticated: true, expires_in_seconds: 900, setup_required: false, legacy_token_available: false })
+      if (url.endsWith('/api/health')) return jsonResponse({ status: 'ready' })
+      if (url.endsWith('/api/reviews')) return jsonResponse({ review_id: reviewId, review }, 201)
+      if (url.includes('/findings/finding-1/fixes')) { fixCalls.push(url); return jsonResponse({ detail: 'fix_provider_unavailable' }, 503) }
+      throw new Error(`Unexpected request ${url}`)
+    })
+    const container = mount()
+    await openCandidate(container)
+    expect(fixCalls).toHaveLength(1)
+    expect(container.textContent).toContain('configured review service could not complete')
+    expect(container.textContent).not.toContain(candidateId)
   })
 })

@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from mcp_server.http_api import ReviewFixService, create_app
 from mcp_server.state import LifecycleState, PROCESS_STATE
+from mcp_server.lifecycle_store import SQLiteLifecycleStore
 
 
 class FakeRetriever:
@@ -67,7 +68,17 @@ def make_client(provider=None, retriever=None, state=None):
         retriever=retriever or FakeRetriever(),
         state=state or LifecycleState(),
     )
-    return TestClient(create_app(lifecycle)), lifecycle
+    class AuthenticatedAdmin:
+        def valid_session(self, token):
+            return token == "test-admin"
+
+        def record_audit(self, *_args, **_kwargs):
+            return None
+
+    client = TestClient(create_app(lifecycle, admin_auth=AuthenticatedAdmin()))
+    client.cookies.set("acr_admin_session", "test-admin", path="/")
+    client.headers.update({"Origin": "http://localhost:5173"})
+    return client, lifecycle
 
 
 def complete_workflow(client):
@@ -168,6 +179,26 @@ def test_reject_workflow_and_export_is_blocked():
     assert client.get(f"/api/fixes/{candidate_id}/export").status_code == 409
 
 
+def test_private_lifecycle_reads_and_decisions_require_admin_and_record_actor():
+    client, _ = make_client()
+    review_id, candidate_id = complete_workflow(client)
+    assert client.post(f"/api/fixes/{candidate_id}/verify").status_code == 200
+    client.cookies.clear()
+    assert client.get(f"/api/reviews/{review_id}").status_code == 401
+    assert client.get(f"/api/fixes/{candidate_id}").status_code == 401
+    assert client.post(f"/api/fixes/{candidate_id}/verify").status_code == 401
+    assert client.post(f"/api/fixes/{candidate_id}/accept").status_code == 401
+    assert client.post(f"/api/fixes/{candidate_id}/reject").status_code == 401
+    assert client.get(f"/api/fixes/{candidate_id}/export").status_code == 401
+    client.cookies.set("acr_admin_session", "test-admin", path="/")
+    accepted = client.post(f"/api/fixes/{candidate_id}/accept")
+    assert accepted.status_code == 200
+    event = accepted.json()["candidate"]["approval_history"][-1]
+    assert event["actor_id"] == "administrator_session"
+    assert event["candidate_id"] == candidate_id
+    assert event["finding_ref"] == "finding-1"
+
+
 def test_unknown_review_and_candidate_handles_return_404():
     client, _ = make_client()
     assert client.get("/api/reviews/missing").status_code == 404
@@ -240,9 +271,22 @@ def test_health_and_import_do_not_initialize_model(monkeypatch):
     assert response.json()["provider_initialized"] is False
 
 
-def test_mcp_tools_and_http_share_the_same_process_state():
+def test_verification_capabilities_report_fail_closed_automation_gates():
+    client, _ = make_client()
+    response = client.get("/api/verification/capabilities")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["syntax"] == "available_ast_parse_only"
+    assert payload["candidate_revision_ci"] == "requires_candidate_revision_and_workflow_identity"
+    assert payload["behavioral"] == "not_run_isolated_execution_broker_unavailable"
+    assert payload["confidence_calibration"] == "unavailable_without_signed_independent_labels"
+    assert payload["commit_execution"] == "disabled_by_default_or_credential_missing"
+
+
+def test_mcp_tools_and_http_share_the_same_process_state(monkeypatch, tmp_path):
     from mcp_server import server
 
+    monkeypatch.setattr(PROCESS_STATE, "persistence_store", SQLiteLifecycleStore(tmp_path / "process.sqlite3"))
     client, _ = make_client(state=PROCESS_STATE)
     assert server._REVIEW_CACHE is PROCESS_STATE.reviews
     assert server._FIX_CANDIDATE_CACHE is PROCESS_STATE.candidates

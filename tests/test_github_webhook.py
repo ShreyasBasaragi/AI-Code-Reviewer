@@ -45,6 +45,14 @@ class OfflineKeychain:
         self.values.pop(name, None)
 
 
+class TestAdminAuth:
+    def valid_session(self, token):
+        return token == "test-admin"
+
+    def record_audit(self, *_args, **_kwargs):
+        return None
+
+
 @pytest.fixture(autouse=True)
 def stop_test_workers():
     yield
@@ -117,7 +125,10 @@ def make_test_client(tmp_path, monkeypatch, *, lifecycle=None, max_body="1048576
     )
     _ACTIVE_PROCESSORS.append(processor)
     client = TestClient(create_app(review_lifecycle, webhook_processor=processor,
+                                   admin_auth=TestAdminAuth(),
                                    credentials=CredentialStore(keychain=OfflineKeychain())))
+    client.cookies.set("acr_admin_session", "test-admin", path="/")
+    client.headers.update({"Origin": "http://localhost:5173"})
     return client, processor, review_lifecycle
 
 
@@ -191,7 +202,7 @@ def test_oversized_webhook_body_is_rejected_before_signature_or_processing(tmp_p
     ("event", "action", "body", "status"),
     [
         ("issues", "opened", payload(), 422),
-        ("pull_request", "edited", payload(action="edited"), 422),
+        ("pull_request", "closed", payload(action="closed"), 422),
         ("pull_request", "opened", b"not-json", 400),
         ("pull_request", "opened", {"action": "opened"}, 400),
     ],
@@ -220,7 +231,7 @@ def test_supported_event_runs_existing_review_callback_and_exposes_private_statu
     assert expected["expected_head_sha"] == HEAD_SHA
 
 
-@pytest.mark.parametrize("action", ["opened", "synchronize", "reopened", "ready_for_review"])
+@pytest.mark.parametrize("action", ["opened", "edited", "synchronize", "reopened", "ready_for_review"])
 def test_each_supported_action_is_accepted_once_when_pr_is_not_draft(tmp_path, monkeypatch, action):
     client, _processor, lifecycle = make_test_client(tmp_path, monkeypatch)
     body = raw_payload(action=action)
@@ -376,6 +387,73 @@ def test_repeated_webhook_store_reads_do_not_accumulate_file_descriptors(tmp_pat
 
     after = len(os.listdir(fd_directory))
     assert after <= before + 2
+
+
+def test_delivery_retry_uses_durable_exponential_backoff_and_dead_letter(tmp_path):
+    store = WebhookDeliveryStore(tmp_path / "retry-deliveries.sqlite3")
+    delivery = parse_delivery(raw_payload(), delivery_id=str(uuid.uuid4()), event="pull_request")
+    store.reserve(delivery)
+    assert store.claim_next(now=100)["attempts"] == 1
+    status, next_at = store.fail(delivery.delivery_id, "github_rate_limited", retryable=True, now=100)
+    assert status == "pending" and next_at == 101
+    assert store.claim_next(now=100) is None
+    assert store.claim_next(now=101)["attempts"] == 2
+    status, next_at = store.fail(delivery.delivery_id, "github_rate_limited", retryable=True, now=101)
+    assert status == "pending" and next_at == 103
+    assert store.claim_next(now=103)["attempts"] == 3
+    status, next_at = store.fail(delivery.delivery_id, "github_rate_limited", retryable=True, now=103)
+    assert status == "dead_letter" and next_at is None
+    row = store.get(delivery.delivery_id)
+    assert row["attempts"] == 3 and row["failure_code"] == "github_rate_limited"
+
+
+def test_manual_delivery_retry_is_bounded_and_blocked_after_any_action(tmp_path):
+    store = WebhookDeliveryStore(tmp_path / "manual-retry.sqlite3")
+    delivery = parse_delivery(raw_payload(), delivery_id=str(uuid.uuid4()), event="pull_request")
+    store.reserve(delivery)
+    store.claim_next(now=200)
+    store.fail(delivery.delivery_id, "github_timeout", now=200)
+    scheduled, next_at, reason = store.schedule_delivery_retry(delivery.delivery_id, now=300)
+    assert scheduled and next_at == 301 and reason == "retry_scheduled"
+    assert store.claim_next(now=300) is None
+
+    store2 = WebhookDeliveryStore(tmp_path / "action-retry.sqlite3")
+    delivery2 = parse_delivery(raw_payload(), delivery_id=str(uuid.uuid4()), event="pull_request")
+    store2.reserve(delivery2)
+    store2.claim_next(now=200)
+    store2.fail(delivery2.delivery_id, "github_timeout", now=200)
+    store2.record_action(
+        delivery_id=delivery2.delivery_id, repository="acme/demo", pr_number=7,
+        base_sha=BASE_SHA, head_sha=HEAD_SHA, finding_id="finding-1",
+        action_type="review_comment", policy_decision={}, publication_status="unknown",
+    )
+    scheduled, next_at, reason = store2.schedule_delivery_retry(delivery2.delivery_id, now=300)
+    assert not scheduled and next_at is None
+    assert reason == "delivery_has_actions_reconcile_before_retry"
+
+
+def test_admin_retry_and_delivery_monitoring_are_authenticated_and_non_sensitive(tmp_path, monkeypatch):
+    client, processor, _ = make_test_client(tmp_path, monkeypatch)
+    delivery = parse_delivery(raw_payload(), delivery_id=str(uuid.uuid4()), event="pull_request")
+    processor.store.reserve(delivery)
+    processor.store.claim_next(now=200)
+    processor.store.fail(delivery.delivery_id, "github_timeout", now=200)
+
+    client.cookies.clear()
+    assert client.get("/api/admin/webhook/deliveries").status_code == 401
+    assert client.post(f"/api/admin/webhook/deliveries/{delivery.delivery_id}/retry").status_code == 401
+
+    client.cookies.set("acr_admin_session", "test-admin", path="/")
+    monitored = client.get("/api/admin/webhook/deliveries")
+    assert monitored.status_code == 200
+    row = next(item for item in monitored.json()["deliveries"]
+               if item["delivery_id"] == delivery.delivery_id)
+    assert row["failure_code"] == "github_timeout" and row["attempts"] == 1
+    assert row["retry_available"] is True
+    assert "result" not in row and "payload_sha256" not in row
+    response = client.post(f"/api/admin/webhook/deliveries/{delivery.delivery_id}/retry")
+    assert response.status_code == 202
+    assert response.json()["next_attempt_at"] > time.time()
 
 
 def test_delivery_payload_validation_blocks_urls_bad_paths_and_invalid_sha():

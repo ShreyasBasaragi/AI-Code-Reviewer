@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, ApiError, utf8ByteLength } from './api'
 import { PythonEditor } from './PythonEditor'
 import { AISettings } from './AISettings'
@@ -46,6 +46,7 @@ export default function App() {
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [backendStatus, setBackendStatus] = useState<'checking' | 'ready' | 'offline'>('checking')
+  const [adminAuthenticated, setAdminAuthenticated] = useState<boolean | null>(null)
   const [reviewMode, setReviewMode] = useState<'manual' | 'github'>('manual')
   const [prUrl, setPrUrl] = useState('')
   const [prResult, setPrResult] = useState<GitHubPRReview | null>(null)
@@ -56,11 +57,17 @@ export default function App() {
   const [statusToken, setStatusToken] = useState('')
   const [webhookActions, setWebhookActions] = useState<GitHubWebhookActionStatus | null>(null)
   const [webhookStatusError, setWebhookStatusError] = useState('')
+  const [recoverReviewId, setRecoverReviewId] = useState('')
+  const [recoverCandidateId, setRecoverCandidateId] = useState('')
   const [activePage, setActivePage] = useState<'review' | 'settings' | 'github'>(() =>
     window.location.pathname === '/settings' || window.location.pathname === '/setup' || window.location.pathname === '/password-reset'
       ? 'settings' : 'review')
 
   const byteCount = useMemo(() => utf8ByteLength(code), [code])
+  const inFlight = useRef(false)
+  const workflowVersion = useRef(0)
+  const prVersion = useRef(0)
+  const candidateVersion = useRef(0)
   const selectedFinding = session?.review.findings.find((finding) => finding.finding_id === selectedFindingId) || null
   const tooLarge = byteCount > MAX_CODE_BYTES || code.length > MAX_CODE_CHARACTERS
 
@@ -68,10 +75,22 @@ export default function App() {
     let live = true
     api.health().then(() => { if (live) setBackendStatus('ready') })
       .catch(() => { if (live) setBackendStatus('offline') })
-    return () => { live = false }
+    api.adminSession().then((status) => { if (live) setAdminAuthenticated(status.authenticated) })
+      .catch(() => { if (live) setAdminAuthenticated(null) })
+    const expired = () => { if (live) setAdminAuthenticated(false) }
+    const authenticated = () => { if (live) setAdminAuthenticated(true) }
+    window.addEventListener('admin-session-expired', expired)
+    window.addEventListener('admin-session-updated', authenticated)
+    return () => {
+      live = false
+      window.removeEventListener('admin-session-expired', expired)
+      window.removeEventListener('admin-session-updated', authenticated)
+    }
   }, [])
 
   function updateCode(value: string) {
+    workflowVersion.current += 1
+    candidateVersion.current += 1
     setCode(value)
     if (session && value !== session.submittedCode) {
       setSession(null)
@@ -84,7 +103,13 @@ export default function App() {
     setError('')
   }
 
+  function openAdminSettings() {
+    setActivePage('settings')
+  }
+
   function resetWorkspace() {
+    workflowVersion.current += 1
+    candidateVersion.current += 1
     setCode('')
     setSession(null)
     setSelectedFindingId('')
@@ -105,9 +130,15 @@ export default function App() {
         : 'The code exceeds the 512 KiB UTF-8 size limit.')
       return
     }
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = ++workflowVersion.current
+    const source = code
     setBusy('review')
     try {
-      const result = await api.submitReview(code)
+      const result = await api.submitReview(source)
+      if (requestVersion !== workflowVersion.current) return
+      candidateVersion.current += 1
       setSession({ reviewId: result.review_id, review: result.review, submittedCode: code, providerIdentity: result.provider_identity })
       const firstFinding = result.review.findings[0]
       setSelectedFindingId(firstFinding?.finding_id || '')
@@ -118,8 +149,9 @@ export default function App() {
         ? `Review complete · ${result.review.findings.length} finding${result.review.findings.length === 1 ? '' : 's'}`
         : 'Review complete · no findings returned.')
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'The review request failed.')
+      if (requestVersion === workflowVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'The review request failed.')
     } finally {
+      inFlight.current = false
       setBusy('')
     }
   }
@@ -132,9 +164,14 @@ export default function App() {
       setError('Enter a canonical https://github.com/owner/repository/pull/number URL.')
       return
     }
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = ++prVersion.current
+    const pullRequestUrl = prUrl.trim()
     setBusy('github')
     try {
-      const result = await api.analyzeGitHubPR(prUrl.trim())
+      const result = await api.analyzeGitHubPR(pullRequestUrl)
+      if (requestVersion !== prVersion.current) return
       setPrResult(result)
       setNotice(result.completion_status === 'complete'
         ? 'Pull request review complete.'
@@ -146,21 +183,26 @@ export default function App() {
             ? 'The pull request could not be reviewed. Check per-file results.'
             : 'Partial review complete. Check skipped files and mapping notes.')
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'The pull request review failed.')
+      if (requestVersion === prVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'The pull request review failed.')
     } finally {
+      inFlight.current = false
       setBusy('')
     }
   }
 
   async function discoverPRRepositories() {
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = ++prVersion.current
     setError(''); setNotice(''); setBusy('repo-discovery')
     try {
       const result = await api.listGitHubRepositories()
+      if (requestVersion !== prVersion.current) return
       setAccessibleRepos(result.repositories)
       setNotice(`${result.repositories.length} repositories are accessible to the configured GitHub token.`)
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Repository discovery failed. Configure administrator GitHub credentials first.')
-    } finally { setBusy('') }
+      if (requestVersion === prVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'Repository discovery failed. Configure administrator GitHub credentials first.')
+    } finally { inFlight.current = false; setBusy('') }
   }
 
   function applySelectedRepository() {
@@ -184,17 +226,58 @@ export default function App() {
     }
     const token = statusToken.trim()
     setStatusToken('')
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = ++prVersion.current
     setBusy('webhook-status')
     try {
-      setWebhookActions(await api.getWebhookActions(deliveryId.trim(), token))
+      const result = await api.getWebhookActions(deliveryId.trim(), token)
+      if (requestVersion === prVersion.current) setWebhookActions(result)
     } catch (requestError) {
-      setWebhookStatusError(requestError instanceof ApiError ? requestError.message : 'Webhook action status could not be loaded.')
+      if (requestVersion === prVersion.current) setWebhookStatusError(requestError instanceof ApiError ? requestError.message : 'Webhook action status could not be loaded.')
     } finally {
+      inFlight.current = false
       setBusy('')
     }
   }
 
+  async function reconcileWebhookAction(actionId: string) {
+    const token = statusToken.trim()
+    if (!token) {
+      setWebhookStatusError('Enter the webhook status token again to reconcile this external write outcome.')
+      return
+    }
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = ++prVersion.current
+    setStatusToken('')
+    setWebhookStatusError('')
+    setBusy('webhook-reconcile')
+    try {
+      const result = await api.reconcileWebhookAction(deliveryId.trim(), actionId, token)
+      if (requestVersion !== prVersion.current) return
+      setWebhookActions((current) => current ? {
+        ...current,
+        actions: current.actions.map((action) => action.action_id !== actionId ? action : {
+          ...action,
+          publication_status: result.status === 'not_published' ? 'failed' : result.status,
+          github_comment_id: result.github_comment_id ?? action.github_comment_id,
+          failure_code: result.status === 'not_published' ? 'reconciled_comment_absent_retry_requires_operator' : action.failure_code,
+        }),
+      } : current)
+      setNotice(result.status === 'published'
+        ? 'A matching GitHub comment already exists; the action is reconciled as published.'
+        : result.status === 'not_published'
+          ? 'No matching comment was found. An administrator can request a policy-checked retry in GitHub Integration settings.'
+          : 'GitHub reported a stale revision. No retry was scheduled.')
+    } catch (requestError) {
+      if (requestVersion === prVersion.current) setWebhookStatusError(requestError instanceof ApiError ? requestError.message : 'GitHub action reconciliation failed.')
+    } finally { inFlight.current = false; setBusy('') }
+  }
+
   function chooseFinding(finding: Finding) {
+    workflowVersion.current += 1
+    candidateVersion.current += 1
     setSelectedFindingId(finding.finding_id)
     setCandidate(null)
     setVerification(null)
@@ -205,29 +288,47 @@ export default function App() {
 
   async function generateFix() {
     if (!session || !selectedFinding || selectedFinding.abstained) return
+    if (adminAuthenticated === false) {
+      setError('Sign in through AI Settings before generating a persisted fix candidate.')
+      return
+    }
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = workflowVersion.current
+    const selectedReviewId = session.reviewId
+    const selectedId = selectedFinding.finding_id
+    const selectedCandidateVersion = candidateVersion.current
     setBusy('generate')
     setError('')
     setNotice('')
     try {
-      const result = await api.generateFix(session.reviewId, selectedFinding.finding_id)
+      const result = await api.generateFix(selectedReviewId, selectedId)
+      if (requestVersion !== workflowVersion.current || selectedCandidateVersion !== candidateVersion.current) return
       setCandidate(result)
       setVerification(null)
       setExportResult(null)
       setNotice('Candidate generated. Review the complete code and diff before verification.')
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Fix generation failed.')
+      if (requestVersion === workflowVersion.current && selectedCandidateVersion === candidateVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'Fix generation failed.')
     } finally {
+      inFlight.current = false
       setBusy('')
     }
   }
 
   async function verifyFix() {
     if (!candidate) return
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = workflowVersion.current
+    const candidateRequestVersion = candidateVersion.current
+    const candidateId = candidate.candidate_id
     setBusy('verify')
     setError('')
     setNotice('')
     try {
-      const result = await api.verifyFix(candidate.candidate_id)
+      const result = await api.verifyFix(candidateId)
+      if (requestVersion !== workflowVersion.current || candidateRequestVersion !== candidateVersion.current) return
       setVerification(result)
       setCandidate({ ...candidate, verification_status: result.verification_status, verification_report: result })
       setNotice(result.verification_status === 'syntax_passed'
@@ -238,49 +339,105 @@ export default function App() {
             ? 'Verification could not complete. Review the reported errors.'
             : 'Python syntax check did not pass.')
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Verification failed.')
+      if (requestVersion === workflowVersion.current && candidateRequestVersion === candidateVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'Verification failed.')
     } finally {
+      inFlight.current = false
       setBusy('')
     }
   }
 
   async function decide(action: 'accept' | 'reject') {
     if (!candidate) return
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = workflowVersion.current
+    const candidateRequestVersion = candidateVersion.current
+    const candidateId = candidate.candidate_id
     setBusy(action)
     setError('')
     setNotice('')
     try {
       const result = action === 'accept'
-        ? await api.acceptFix(candidate.candidate_id)
-        : await api.rejectFix(candidate.candidate_id)
+        ? await api.acceptFix(candidateId)
+        : await api.rejectFix(candidateId)
+      if (requestVersion !== workflowVersion.current || candidateRequestVersion !== candidateVersion.current) return
       setCandidate(result.candidate)
       setExportResult(null)
       setNotice(result.message)
       if (result.error || result.outcome === 'blocked') setError(result.message)
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : `Could not ${action} this candidate.`)
+      if (requestVersion === workflowVersion.current && candidateRequestVersion === candidateVersion.current) setError(requestError instanceof ApiError ? requestError.message : `Could not ${action} this candidate.`)
     } finally {
+      inFlight.current = false
       setBusy('')
     }
   }
 
   async function exportFix() {
     if (!candidate) return
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = workflowVersion.current
+    const candidateRequestVersion = candidateVersion.current
+    const candidateId = candidate.candidate_id
     setBusy('export')
     setError('')
     setNotice('')
     try {
-      const result = await api.exportFix(candidate.candidate_id)
+      const result = await api.exportFix(candidateId)
+      if (requestVersion !== workflowVersion.current || candidateRequestVersion !== candidateVersion.current) return
       setExportResult(result)
       const base = sanitizeFilename(result.filename || 'candidate.py', '.py').replace(/\.py$/, '')
       downloadText(result.corrected_code, `${base}.py`, 'text/x-python')
       downloadText(result.unified_diff, `${base}.patch`, 'text/x-diff')
       setNotice('Python source and backend-generated diff downloaded.')
     } catch (requestError) {
-      setError(requestError instanceof ApiError ? requestError.message : 'Export failed.')
+      if (requestVersion === workflowVersion.current && candidateRequestVersion === candidateVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'Export failed.')
     } finally {
+      inFlight.current = false
       setBusy('')
     }
+  }
+
+  async function recoverReview() {
+    const id = recoverReviewId.trim()
+    if (!id) { setError('Enter the full review ID to recover it.'); return }
+    if (adminAuthenticated !== true) { setError('Sign in through AI Settings to recover persisted reviews.'); return }
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = ++workflowVersion.current
+    candidateVersion.current += 1
+    setBusy('recover-review'); setError(''); setNotice('')
+    try {
+      const result = await api.getReview(id)
+      if (requestVersion !== workflowVersion.current) return
+      setSession({ reviewId: result.review_id, review: result.review, submittedCode: code })
+      setSelectedFindingId(result.review.findings[0]?.finding_id || '')
+      setCandidate(null); setVerification(null); setExportResult(null)
+      setNotice('Persisted review recovered. Its submitted source remains on the backend and was not copied into browser storage.')
+    } catch (requestError) {
+      if (requestVersion === workflowVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'The saved review could not be recovered.')
+    } finally { inFlight.current = false; setBusy('') }
+  }
+
+  async function recoverCandidate() {
+    const id = recoverCandidateId.trim()
+    if (!id) { setError('Enter the full candidate ID to recover it.'); return }
+    if (adminAuthenticated !== true) { setError('Sign in through AI Settings to recover persisted candidates.'); return }
+    if (inFlight.current) return
+    inFlight.current = true
+    const requestVersion = ++workflowVersion.current
+    const nextCandidateVersion = ++candidateVersion.current
+    setBusy('recover-candidate'); setError(''); setNotice('')
+    try {
+      const result = await api.getFix(id)
+      if (requestVersion !== workflowVersion.current || nextCandidateVersion !== candidateVersion.current) return
+      setCandidate(result)
+      setSession(null); setSelectedFindingId(''); setVerification(null); setExportResult(null)
+      setNotice(`Candidate recovered with stored approval state “${result.approval_status}”. Run verification again before export or a new approval decision.`)
+    } catch (requestError) {
+      if (requestVersion === workflowVersion.current) setError(requestError instanceof ApiError ? requestError.message : 'The saved candidate could not be recovered.')
+    } finally { inFlight.current = false; setBusy('') }
   }
 
   const evidenceById = new Map((session?.review.evidence || []).map((item) => [item.evidence_id, item]))
@@ -325,9 +482,19 @@ export default function App() {
           <p>Review Python with relevant evidence, inspect a proposed fix, and decide what happens next.</p>
         </section>
 
+        <section className="panel recovery-panel" aria-label="Recover a saved workflow">
+          <div className="panel-heading"><div><div className="panel-kicker">PERSISTED WORKFLOW</div><h2>Recover a saved review or candidate</h2></div></div>
+          <p>Paste a full ID from an earlier session. Private source is not stored in this browser. Administrator sign-in is required to recover records.</p>
+          {adminAuthenticated !== true && <div className="settings-message" role="status">{adminAuthenticated === false ? 'Sign in to AI Settings to recover reviews or continue fix workflows.' : 'Checking administrator session…'} <button className="secondary-button" type="button" onClick={openAdminSettings}>Open AI Settings</button></div>}
+          <div className="recovery-forms">
+            <form onSubmit={(event) => { event.preventDefault(); void recoverReview() }}><label htmlFor="recover-review-id">Review ID</label><div className="settings-actions"><input id="recover-review-id" value={recoverReviewId} onChange={(event) => setRecoverReviewId(event.target.value)} autoComplete="off" placeholder="Paste the full review ID" disabled={!!busy} /><button className="secondary-button" type="submit" disabled={!!busy || adminAuthenticated !== true}>{busy === 'recover-review' ? 'Recovering…' : 'Recover review'}</button></div></form>
+            <form onSubmit={(event) => { event.preventDefault(); void recoverCandidate() }}><label htmlFor="recover-candidate-id">Candidate ID</label><div className="settings-actions"><input id="recover-candidate-id" value={recoverCandidateId} onChange={(event) => setRecoverCandidateId(event.target.value)} autoComplete="off" placeholder="Paste the full candidate ID" disabled={!!busy} /><button className="secondary-button" type="submit" disabled={!!busy || adminAuthenticated !== true}>{busy === 'recover-candidate' ? 'Recovering…' : 'Recover candidate'}</button></div></form>
+          </div>
+        </section>
+
         <div className="review-mode-switch" role="tablist" aria-label="Review source">
-          <button role="tab" aria-selected={reviewMode === 'manual'} className={reviewMode === 'manual' ? 'active' : ''} onClick={() => { setReviewMode('manual'); setError(''); setNotice('') }}>Manual code</button>
-          <button role="tab" aria-selected={reviewMode === 'github'} className={reviewMode === 'github' ? 'active' : ''} onClick={() => { setReviewMode('github'); setError(''); setNotice('') }}>GitHub pull request</button>
+          <button role="tab" aria-selected={reviewMode === 'manual'} className={reviewMode === 'manual' ? 'active' : ''} onClick={() => { prVersion.current += 1; setReviewMode('manual'); setError(''); setNotice('') }}>Manual code</button>
+          <button role="tab" aria-selected={reviewMode === 'github'} className={reviewMode === 'github' ? 'active' : ''} onClick={() => { prVersion.current += 1; setReviewMode('github'); setError(''); setNotice('') }}>GitHub pull request</button>
         </div>
 
         {reviewMode === 'github' && <section className="panel pr-panel">
@@ -336,7 +503,7 @@ export default function App() {
             <label htmlFor="github-pr-url">GitHub pull request URL</label>
             <div className="settings-actions"><button className="secondary-button" type="button" disabled={!!busy} onClick={() => void discoverPRRepositories()}>{busy === 'repo-discovery' ? 'Discovering…' : 'Discover accessible repositories'}</button></div>
             {accessibleRepos.length > 0 && <div className="pr-repository-select"><label htmlFor="pr-repository">Configured repository</label><select id="pr-repository" value={selectedRepo} onChange={(event) => setSelectedRepo(event.target.value)}><option value="">Choose repository…</option>{accessibleRepos.map((repo) => <option key={repo.full_name} value={repo.full_name}>{repo.full_name}</option>)}</select><label htmlFor="pr-number">PR number</label><input id="pr-number" type="number" min="1" step="1" value={selectedPrNumber} onChange={(event) => setSelectedPrNumber(event.target.value)} /><button className="secondary-button" type="button" onClick={applySelectedRepository}>Use selected repository</button></div>}
-            <div className="pr-input-row"><input id="github-pr-url" type="url" autoComplete="url" placeholder="https://github.com/owner/repository/pull/123" value={prUrl} onChange={(event) => { setPrUrl(event.target.value); setPrResult(null) }} disabled={busy === 'github'} />
+            <div className="pr-input-row"><input id="github-pr-url" type="url" autoComplete="url" placeholder="https://github.com/owner/repository/pull/123" value={prUrl} onChange={(event) => { prVersion.current += 1; setPrUrl(event.target.value); setPrResult(null) }} disabled={busy === 'github'} />
               <button className="primary-button" type="submit" disabled={busy === 'github' || !prUrl.trim()}>{busy === 'github' ? <><span className="spinner" /> Analyzing…</> : <>Analyze PR <span aria-hidden="true">→</span></>}</button>
             </div>
             <small>Public repositories can be read without a token. Private repositories need a backend GITHUB_TOKEN with read access. Manual analysis is always read-only; webhook comment publication is separately configured and off by default. Autonomous fixing and commit execution are disabled.</small>
@@ -344,33 +511,43 @@ export default function App() {
           <div className="pr-form webhook-status-form">
             <div className="panel-kicker">WEBHOOK ACTION STATUS</div>
             <label htmlFor="webhook-delivery-id">Delivery ID</label>
-            <div className="pr-input-row"><input id="webhook-delivery-id" value={deliveryId} onChange={(event) => { setDeliveryId(event.target.value); setWebhookActions(null) }} placeholder="GitHub delivery UUID" autoComplete="off" />
-              <input id="webhook-status-token" type="password" value={statusToken} onChange={(event) => setStatusToken(event.target.value)} placeholder="Status token (not saved)" autoComplete="off" />
+            <div className="pr-input-row"><input id="webhook-delivery-id" value={deliveryId} onChange={(event) => { prVersion.current += 1; setDeliveryId(event.target.value); setWebhookActions(null) }} placeholder="GitHub delivery UUID" autoComplete="off" disabled={busy === 'webhook-status' || busy === 'webhook-reconcile'} />
+              <input id="webhook-status-token" type="password" value={statusToken} onChange={(event) => setStatusToken(event.target.value)} placeholder="Status token (not saved)" autoComplete="off" disabled={busy === 'webhook-status' || busy === 'webhook-reconcile'} />
               <button className="secondary-button" type="button" disabled={busy === 'webhook-status'} onClick={() => void inspectWebhookActions()}>{busy === 'webhook-status' ? 'Loading…' : 'Check status'}</button>
             </div>
             <small>The status token is sent only with this request and cleared afterward. Webhook results stay behind the backend status-token check.</small>
             {webhookStatusError && <div className="processing-errors" role="alert">{webhookStatusError}</div>}
             {webhookActions && <div className="webhook-action-status" role="status">
-              <strong>{webhookActions.repository}#{webhookActions.pr_number} · {webhookActions.status}</strong>
+              <strong>Webhook delivery · {webhookActions.repository}#{webhookActions.pr_number} · {webhookActions.status}</strong>
               {(webhookActions.head_sha || webhookActions.base_sha) && <small>Base {webhookActions.base_sha?.slice(0, 12) || 'unknown'} · head {webhookActions.head_sha?.slice(0, 12) || 'unknown'}</small>}
               {webhookActions.failure_code && <small>Delivery failure: {webhookActions.failure_code}</small>}
-              <div>Review mode: {webhookActions.actions.length ? 'Policy-evaluated' : 'Review-only'} · Autonomous commits: Disabled</div>
+              <div>Review mode: {webhookActions.actions.length ? 'Policy-evaluated' : 'Review-only'} · Automatic fixes require every backend gate</div>
               {webhookActions.actions.length === 0 && <small>No GitHub action was recorded for this delivery.</small>}
               {webhookActions.actions.map((action) => {
-                const label = action.action_type === 'review_comment' && action.publication_status === 'published' ? 'Published comment'
-                  : action.action_type === 'review_comment' && ['failed', 'unknown'].includes(action.publication_status) ? 'Failed or unconfirmed GitHub action'
-                    : action.action_type === 'review_comment' && action.publication_status === 'denied' ? 'Comment blocked by policy'
-                    : action.action_type === 'autonomous_fix' && action.policy_decision.action === 'potential_autonomous_fix' ? 'Fix pending required verification'
-                      : action.action_type === 'autonomous_fix' ? 'Fix blocked by policy'
-                        : action.policy_decision.action === 'no_external_action' ? 'No external action · finding validation incomplete'
-                          : action.action_type === 'policy_decision' ? 'Review-only · action denied by policy'
-                        : action.publication_status === 'skipped' || action.publication_status === 'stale' ? 'Comment skipped or stale'
-                          : 'Comment action pending'
+                const commentKind = action.policy_decision?.comment_kind === 'general' ? 'PR' : 'inline'
+                const label = action.action_type === 'review_comment' && action.publication_status === 'published'
+                  ? `Comment published (${commentKind})`
+                  : action.action_type === 'review_comment' && action.publication_status === 'failed' ? 'Comment publication failed'
+                    : action.action_type === 'review_comment' && ['unknown', 'requires_reconciliation'].includes(action.publication_status) ? 'Comment outcome unknown · reconciliation required'
+                      : action.action_type === 'review_comment' && ['denied', 'blocked'].includes(action.publication_status) ? 'Comment blocked by policy'
+                        : action.action_type === 'review_comment' && ['skipped', 'stale'].includes(action.publication_status) ? `Comment ${action.publication_status}`
+                          : action.action_type === 'review_comment' && action.publication_status === 'pending' ? 'Comment pending'
+                            : action.action_type === 'review_comment' && action.publication_status === 'running' ? 'Comment publishing'
+                              : action.action_type === 'autonomous_fix' && action.publication_status === 'published' ? 'Automatic fix commit confirmed'
+                                : action.action_type === 'autonomous_fix' && ['unknown', 'requires_reconciliation'].includes(action.publication_status) ? 'Commit outcome unknown · reconcile required'
+                                  : action.action_type === 'autonomous_fix' && ['pending', 'running', 'pending_required_verification'].includes(action.publication_status) ? 'Fix verification in progress'
+                                    : action.action_type === 'autonomous_fix' ? 'Automatic fix blocked · manual review required'
+                                  : action.publication_status === 'AUTONOMOUS_COMMIT_DISABLED' ? 'Automatic fix disabled by runtime gates'
+                                    : action.policy_decision?.action === 'no_external_action' ? 'No external action · finding validation incomplete'
+                                      : 'Policy decision · no GitHub write'
                 return <div className="webhook-action-row" key={action.action_id}>
                   <b>{label}</b><small>Action {action.action_id} · {action.finding_id} · {action.lifecycle_state || action.publication_status.replaceAll('_', ' ')}</small>
-                  <small>Verification: {action.verification_status || 'not reported'} · GitHub comment: {action.github_comment_id ?? 'none'} · Commit: disabled</small>
+                  <small>Verification: {action.verification_status || 'not reported'} · GitHub comment: {action.github_comment_id ?? 'none'} · Commit: {action.commit_sha || 'not confirmed'}</small>
+                  {action.execution_evidence?.candidate?.candidate_branch && <small>Candidate branch: {action.execution_evidence.candidate.candidate_branch} · candidate SHA: {action.execution_evidence.candidate.candidate_sha?.slice(0, 12) || 'not reported'}</small>}
+                  {action.action_type === 'autonomous_fix' && <small>Confidence: {action.execution_evidence?.confidence?.calibrated ? `${((action.execution_evidence.confidence.calibrated_confidence || 0) * 100).toFixed(1)}% calibrated` : 'Not verified'} · Behavioral: {action.execution_evidence?.behavioral?.status || 'Not Run'} · Candidate CI: {action.execution_evidence?.ci?.status || 'Not Run'}</small>}
                   {action.failure_code && <small>Failure: {action.failure_code}</small>}
-                  {action.policy_decision.denial_reasons.length > 0 && <small>{action.policy_decision.denial_reasons.join(', ')}</small>}
+                  {!!action.policy_decision?.denial_reasons?.length && <small>{action.policy_decision.denial_reasons.join(', ')}</small>}
+                  {['unknown', 'requires_reconciliation'].includes(action.publication_status) && <button className="secondary-button" type="button" disabled={!!busy || !statusToken.trim()} onClick={() => void reconcileWebhookAction(action.action_id)}>{busy === 'webhook-reconcile' ? 'Reconciling…' : action.action_type === 'autonomous_fix' ? 'Reconcile commit status' : 'Reconcile comment status'}</button>}
                 </div>
               })}
             </div>}
@@ -379,13 +556,17 @@ export default function App() {
             <span>{error ? '!' : '✓'}</span><p>{error || notice}</p><button aria-label="Dismiss message" onClick={() => { setError(''); setNotice('') }}>×</button>
           </div>}
           {prResult && <div className="pr-results">
+            <div className="pr-status-note" role="status"><strong>Review generated · not published</strong><span>Manual PR analysis is read-only. This result does not mean a GitHub comment was posted.</span></div>
             <div className="pr-result-heading"><div><span className={`pr-completion ${prResult.completion_status}`}>{prResult.completion_status.replaceAll('_', ' ')}</span><h3><a href={prResult.html_url} target="_blank" rel="noreferrer">{prResult.repository}#{prResult.number} · {prResult.title}</a></h3><small>PR state: {prResult.state} · head {prResult.head_sha.slice(0, 12)}</small></div>
               <div className="pr-stats"><span>{prResult.files_reviewed}<small>Reviewed</small></span><span>{prResult.files_skipped}<small>Skipped</small></span><span>{prResult.files_failed}<small>Failed</small></span></div>
             </div>
+            {(prResult.stale || prResult.completion_status === 'stale') && <div className="processing-errors" role="alert"><strong>This review is stale</strong><div>{prResult.stale_reason || 'The pull request changed while the review was running. Re-run the review against the current revision.'}</div></div>}
             <div className="pr-status-note">{prResult.total_changed_files} changed files · {prResult.files_received} retrieved · {Object.values(prResult.findings_by_severity).reduce((sum, count) => sum + count, 0)} findings · Provider/model: {prResult.provider_identity || 'not reported'}</div>
             <div className="pr-status-note" role="status">
-              Manual PR review: Review-only · Source sharing: {prResult.action_policy?.source_sharing_authorization || 'not reported'} · Webhook comments: {prResult.action_policy?.webhook_comment_publication === 'enabled' ? 'Enabled by administrator policy' : 'Disabled'} · Fix preparation: {prResult.action_policy?.autonomous_fix_preparation || 'Disabled'} · Automatic commits: Disabled
+              Manual PR review: Review-only · Source sharing: {prResult.action_policy?.source_sharing_authorization || 'not reported'} · Webhook comments: {prResult.action_policy?.webhook_comment_publication === 'enabled' ? 'Enabled by administrator policy' : 'Disabled'} · Fix policy: {prResult.action_policy?.autonomous_fix_preparation || 'Disabled'} · Candidate staging: {prResult.action_policy?.candidate_staging_enabled === 'true' ? 'configured' : 'disabled'} · Final write gate: {prResult.action_policy?.commit_execution_enabled === 'true' ? 'configured; other gates still required' : 'disabled'}
             </div>
+            {prResult.repository_context && <div className="pr-status-note">Repository guidance context · {prResult.repository_context.status}{prResult.repository_context.revision ? ` · revision ${prResult.repository_context.revision.slice(0, 12)}` : ''}{prResult.repository_context.files ? ` · ${prResult.repository_context.files.length} files` : ''}</div>}
+            {!!prResult.repository_context?.warnings?.length && <div className="processing-errors"><strong>Repository context warnings</strong>{prResult.repository_context.warnings.map((warning, index) => <div key={index}>{warning}</div>)}</div>}
             {(prResult.pagination_truncated || prResult.pagination_error) && <div className="processing-errors"><strong>Changed-file list was incomplete</strong><div>{prResult.pagination_error || 'Configured pagination or file limit reached.'}</div></div>}
             {prResult.files.map((file) => {
               const evidenceById = new Map(file.evidence.map((item) => [item.evidence_id, item]))
@@ -440,7 +621,7 @@ export default function App() {
 
           <section className="panel findings-panel" id="evidence">
             <div className="panel-heading findings-heading"><div><div className="panel-kicker">ANALYSIS</div><h2>Review findings <span className="count-badge">{session?.review.findings.length ?? '—'}</span></h2></div>
-              {session && <span className="review-id">ID {session.reviewId.slice(0, 8)}</span>}
+              {session && <span className="review-id">Review ID <code>{session.reviewId}</code></span>}
             </div>
             {!session ? <div className="empty-analysis"><div className="empty-icon"><span>⌕</span></div><h3>Your review will appear here</h3><p>Add Python code and start a review. Findings include evidence references when relevant sources are available.</p><div className="empty-hint"><span>↳</span> No code is sent until you choose Review code</div></div> : <div className="analysis-content">
               <div className="review-summary"><div className="summary-icon">✳</div><div><span>REVIEW SUMMARY</span><p>{session.review.summary || 'The review returned without a summary.'}</p><small>Provider/model: {session.providerIdentity || 'not reported'}</small></div></div>
@@ -457,6 +638,7 @@ export default function App() {
               {selectedFinding && <div className="selected-finding">
                 <div className="detail-topline"><span>SELECTED FINDING</span>{selectedFinding.uncertain && <span className="uncertain-tag">Uncertain</span>}</div>
                 <h3>{selectedFinding.title}</h3><p className="finding-explanation">{selectedFinding.explanation}</p>
+                <div className="finding-location">{selectedFinding.affected_file ? <>{selectedFinding.affected_file}{selectedFinding.line_start ? ` · line ${selectedFinding.line_start}${selectedFinding.line_end && selectedFinding.line_end !== selectedFinding.line_start ? `–${selectedFinding.line_end}` : ''}` : ''}</> : selectedFinding.line_start ? `Line ${selectedFinding.line_start}${selectedFinding.line_end && selectedFinding.line_end !== selectedFinding.line_start ? `–${selectedFinding.line_end}` : ''}` : 'Source location unavailable'}</div>
                 <div className="recommendation"><span>RECOMMENDED FIX</span><p>{selectedFinding.recommended_fix}</p></div>
                 {selectedFinding.abstained && <div className="abstained-note">The reviewer abstained from proposing a fix for this finding.</div>}
                 {!!selectedFinding.evidence_ids.length && <div className="evidence-block"><span className="evidence-heading">EVIDENCE <i>{selectedFinding.evidence_ids.length}</i></span>
@@ -464,9 +646,10 @@ export default function App() {
                     {(evidence?.rule_identifier || evidence?.source_url) && <div className="evidence-meta">{evidence.rule_identifier}{evidence.rule_identifier && evidence.source_url ? ' · ' : ''}{evidence.source_url}</div>}
                     {evidence?.text && <p>{evidence.text}</p>}</div> })}
                 </div>}
-                <button className="secondary-button generate-button" onClick={generateFix} disabled={!!busy || selectedFinding.abstained}>
+                <button className="secondary-button generate-button" onClick={generateFix} disabled={!!busy || selectedFinding.abstained || adminAuthenticated === false}>
                   {busy === 'generate' ? <><span className="spinner dark" /> Generating candidate…</> : <>✦ Generate fix candidate <span>→</span></>}
                 </button>
+                {adminAuthenticated === false && <small className="auth-required-note">Administrator session required. <button type="button" className="text-button" onClick={openAdminSettings}>Open AI Settings</button></small>}
               </div>}
             </div>}
           </section>
@@ -486,24 +669,26 @@ export default function App() {
             <div className="code-view"><div className="code-view-heading"><span><i className="remove-dot" /> Original source</span><small>UNCHANGED</small></div><PythonEditor label="Original source code" value={candidate.original_code} onChange={() => undefined} readOnly /></div>
             <div className="code-view"><div className="code-view-heading"><span><i className="add-dot" /> Corrected candidate</span><small>NOT APPLIED</small></div><PythonEditor label="Corrected candidate code" value={candidate.corrected_code || ''} onChange={() => undefined} readOnly /></div>
           </div>
+          {candidate.verification_report && !verification && <div className="processing-errors" role="status">A saved verification report exists, but this recovered candidate is not marked verified in the current session. Run verification again.</div>}
           <div className="verify-row"><div className={`syntax-status ${verification?.syntax_check.status || 'not-run'}`}><span>{verification?.syntax_check.status === 'passed' ? '✓' : verification?.syntax_check.status === 'failed' || verification?.syntax_check.status === 'errored' ? '!' : '○'}</span><div><strong>{verification?.syntax_check.status === 'passed' ? 'Python syntax passed' : verification?.verification_status === 'syntax_failed' ? 'Python syntax failed' : verification?.syntax_check.status === 'errored' ? 'Syntax check errored' : 'Syntax not checked'}</strong>
             {verification?.syntax_check.status === 'failed' && <small>{verification.syntax_check.error_type}: {verification.syntax_check.message}{verification.syntax_check.line ? ` · line ${verification.syntax_check.line}${verification.syntax_check.column ? `, column ${verification.syntax_check.column}` : ''}` : ''}</small>}
             {verification?.verification_status === 'syntax_passed' && <small>AST parsing passed. Behavioral tests were not run.</small>}
           </div></div><button className="secondary-button verify-button" onClick={verifyFix} disabled={!!busy}>{busy === 'verify' ? <><span className="spinner dark" /> Checking…</> : 'Verify syntax & static analysis'}</button></div>
-          <div className="not-run-row"><span>Static verification <b>{verification?.static_analysis_status || 'Not Run'}</b></span><span>Behavioral testing <b>Not Run</b></span><small>Candidate code is never executed by this workflow.</small></div>
+          <div className="not-run-row"><span>Static verification <b>{verification?.static_analysis_status || 'Not Run'}</b></span><span>Behavioral testing <b>Not Run</b></span><span>Candidate CI <b>Not Run</b></span><small>Candidate code is never executed here. GitHub commits remain disabled.</small></div>
           {!!verification?.introduced_static_issues?.length && <div className="processing-errors"><strong>New static-analysis issues</strong>{verification.introduced_static_issues.map((issue) => <div key={issue.finding_id}>{issue.rule_id} · line {issue.line_start}: {issue.title}</div>)}</div>}
           {!!verification?.pre_existing_static_issues?.length && <div className="processing-errors"><strong>Pre-existing static-analysis issues</strong>{verification.pre_existing_static_issues.map((issue) => <div key={issue.finding_id}>{issue.rule_id} · line {issue.line_start}: {issue.title}</div>)}</div>}
           {!!verification?.static_analysis_errors?.length && <div className="processing-errors"><strong>Static-analysis errors</strong>{verification.static_analysis_errors.map((issue, i) => <div key={i}>{issue.source || 'Source'}: {issue.error_type || 'Error'}{issue.message ? ` · ${issue.message}` : ''}</div>)}</div>}
           <div className="approval-actions"><div><strong>Approval is your decision</strong><small>Accepting does not apply this code or guarantee it behaves correctly.</small></div><div className="approval-buttons">
-            <button className="reject-button" onClick={() => decide('reject')} disabled={!!busy || candidate.approval_status !== 'pending'}>{busy === 'reject' ? 'Rejecting…' : 'Reject'}</button>
-            <button className="accept-button" onClick={() => decide('accept')} disabled={!!busy || !canAccept}>{busy === 'accept' ? 'Accepting…' : 'Accept candidate'}</button>
+            <button className="reject-button" onClick={() => decide('reject')} disabled={!!busy || candidate.approval_status !== 'pending' || adminAuthenticated === false}>{busy === 'reject' ? 'Rejecting…' : 'Reject'}</button>
+            <button className="accept-button" onClick={() => decide('accept')} disabled={!!busy || !canAccept || adminAuthenticated === false}>{busy === 'accept' ? 'Accepting…' : 'Accept candidate'}</button>
           </div></div>
-          {candidate.approval_status === 'accepted' && <div className="export-row"><div><span className="export-check">✓</span><div><strong>Candidate accepted</strong><small>Download both the corrected Python source and the backend diff.</small></div></div><button className="primary-button export-button" onClick={exportFix} disabled={!!busy}>{busy === 'export' ? <><span className="spinner" /> Preparing…</> : <>↓ Export files</>}</button></div>}
+          {candidate.approval_status === 'accepted' && <div className="export-row"><div><span className="export-check">✓</span><div><strong>Candidate accepted</strong><small>Download both the corrected Python source and the backend diff after current-session verification passes.</small></div></div><button className="primary-button export-button" onClick={exportFix} disabled={!!busy || !verification || verification.verification_status !== 'syntax_passed' || verification.static_analysis_status !== 'passed' || adminAuthenticated === false}>{busy === 'export' ? <><span className="spinner" /> Preparing…</> : <>↓ Export files</>}</button></div>}
           {candidate.approval_status === 'rejected' && <div className="rejected-note">Candidate rejected. Original source and review remain unchanged.</div>}
           {exportResult && <div className="export-confirmation" role="status">Export prepared for <code>{sanitizeFilename(exportResult.filename, '.py')}</code> and its `.patch` diff.</div>}
         </section>}
         </>}
         </>}
+        {error && error.includes('Administrator sign-in') && <button className="secondary-button" type="button" onClick={openAdminSettings}>Open AI Settings</button>}
         <footer className="page-footer"><span>CRITIQUE <i>·</i> EVIDENCE-GROUNDED CODE REVIEW</span><span>Syntax checks do not replace tests or human review.</span></footer>
       </div>
     </main>

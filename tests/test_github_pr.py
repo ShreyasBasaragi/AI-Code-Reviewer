@@ -85,6 +85,41 @@ def test_rest_client_blocks_redirects_and_bad_responses():
     assert malformed.value.code == "github_invalid_response"
 
 
+def test_ci_evidence_binds_check_runs_to_successful_dispatched_workflow(monkeypatch):
+    sha = "a" * 40
+    client = GitHubRESTClient(token="read-token")
+    calls = []
+
+    def fake_get(path, query=None):
+        calls.append((path, query))
+        if path.endswith("/check-runs"):
+            return {"sha": sha, "check_runs": [{
+                "name": "unit", "head_sha": sha, "check_suite": {"id": 71},
+            }, {
+                "name": "untrusted", "head_sha": sha, "check_suite": {"id": 72},
+            }]}, {}
+        if path.endswith("/status"):
+            return {"statuses": []}, {}
+        if path.endswith("/actions/workflows/7/runs"):
+            return {"workflow_runs": [{
+                "workflow_id": 7, "head_sha": sha, "event": "workflow_dispatch",
+                "status": "completed", "conclusion": "success", "check_suite_id": 71,
+            }, {
+                "workflow_id": 8, "head_sha": sha, "event": "workflow_dispatch",
+                "status": "completed", "conclusion": "success", "check_suite_id": 72,
+            }]}, {}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(client, "_get", fake_get)
+    evidence = client.get_ci_evidence(PullRequestRef("acme", "demo", 7), sha, "7")
+    assert evidence["check_runs"][0]["workflow_identity"] == "7"
+    assert "workflow_identity" not in evidence["check_runs"][1]
+    assert calls[-1] == (
+        "/repos/acme/demo/actions/workflows/7/runs",
+        {"head_sha": sha, "per_page": "100"},
+    )
+
+
 @pytest.mark.parametrize("status,headers,expected", [
     (401, {}, "github_unauthorized"),
     (403, {"X-RateLimit-Remaining": "0"}, "github_rate_limited"),

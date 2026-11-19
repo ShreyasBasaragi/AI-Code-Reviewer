@@ -80,6 +80,41 @@ def test_legacy_retrieval_api_still_returns_text(monkeypatch):
     assert retrieve.retrieve_context("assert x") == [evidence.text]
 
 
+def test_missing_v2_corpus_is_reported_to_review_pipeline_without_creating_database(
+    monkeypatch, tmp_path
+):
+    missing_database = tmp_path / "missing-v2-db"
+    monkeypatch.setattr(retrieve, "CHROMA_PERSIST_DIR", missing_database)
+    monkeypatch.setattr(retrieve, "_chroma_client", None)
+    monkeypatch.setattr(retrieve, "_collection", None)
+    monkeypatch.setattr(retrieve, "_embedding_function", None)
+
+    class FakeLLM:
+        def analyze_code(self, code, context):
+            assert code == "value = 1"
+            assert context == []
+            return '{"summary":"No issues.","findings":[]}'
+
+    result = orchestrator.run_review_pipeline(
+        code="value = 1",
+        llm=FakeLLM(),
+        notify_desktop=False,
+    )
+
+    assert result.review_response.valid is True
+    assert result.retrieved_context == []
+    assert any("retrieval_failure: RAGConfigurationError" in error
+               for error in result.review_response.processing_errors)
+    assert not missing_database.exists()
+
+    evidence, diagnostics = retrieve.retrieve_evidence_with_diagnostics("value = 1")
+    assert evidence == []
+    assert diagnostics["status"] == "errored"
+    assert diagnostics["error_type"] == "RAGConfigurationError"
+    # Preserve the old text-only interface while still logging the failure.
+    assert retrieve.retrieve_context("value = 1") == []
+
+
 def test_valid_review_response_cites_supplied_evidence():
     evidence = RetrievedEvidence(
         evidence_id="rule-17",

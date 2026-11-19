@@ -64,7 +64,7 @@ def test_deduplication_and_filtering():
     assert stats["records_deduplicated"] == 1
 
 
-def test_frozen_retrieve_context_interface():
+def test_frozen_retrieve_context_interface(isolated_v2_rag):
     code_sample = "def calculate_sum(a, b=[]): return a + b"
     results = retrieve_context(code_sample)
 

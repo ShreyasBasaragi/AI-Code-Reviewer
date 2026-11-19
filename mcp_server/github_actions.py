@@ -7,14 +7,17 @@ The adapter exposes no arbitrary URL, path, branch, or request operation.
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import socket
+import os
 import urllib.request
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
+import time
 
 from mcp_server.github_pr import API_BASE, API_VERSION, GitHubPRException, PullRequestRef
 from mcp_server.github_policy import commit_execution_decision
@@ -54,12 +57,20 @@ class GitHubActionResult:
 
 
 class GitHubMCPActionAdapter:
-    """MCP-integrated capability boundary; only fixed review-comment writes exist."""
+    """Narrow GitHub action boundary for comments and gated candidate commits."""
 
     def __init__(self, *, read_client: Any, token: Optional[str] = None,
-                 transport: Optional[Callable[[str, str, Mapping[str, str], bytes], Any]] = None) -> None:
+                 transport: Optional[Callable[[str, str, Mapping[str, str], bytes], Any]] = None,
+                 staging_token: Optional[str] = None, commit_token: Optional[str] = None,
+                 staging_enabled: Optional[bool] = None, commit_enabled: Optional[bool] = None) -> None:
         self.read_client = read_client
         self.token = token
+        self.staging_token = staging_token if staging_token is not None else os.getenv("GITHUB_CANDIDATE_STAGING_TOKEN")
+        self.commit_token = commit_token if commit_token is not None else os.getenv("GITHUB_AUTONOMOUS_COMMIT_TOKEN")
+        self.staging_enabled = (_explicit_env_enabled("GITHUB_CANDIDATE_STAGING_ENABLED")
+                                if staging_enabled is None else staging_enabled is True)
+        self.commit_enabled = (_explicit_env_enabled("GITHUB_AUTONOMOUS_COMMIT_ENABLED")
+                               if commit_enabled is None else commit_enabled is True)
         self.transport = transport or self._request
 
     def publish_inline_comment(self, ref: PullRequestRef, *, repository: str,
@@ -97,7 +108,7 @@ class GitHubMCPActionAdapter:
             response = self.transport("POST", API_BASE + endpoint, self._headers(), payload)
         except GitHubPRException as exc:
             # A network timeout after a write is ambiguous. Never retry here.
-            status = "unknown" if exc.code in {"github_timeout", "github_network_error"} else "failed"
+            status = "unknown" if exc.code in {"github_timeout", "github_network_error", "github_unavailable"} else "failed"
             return self._result(status, ref, repository, finding_id, exc.code)
         github_id = response.get("id") if isinstance(response, dict) and isinstance(response.get("id"), int) else None
         if github_id is None:
@@ -105,8 +116,40 @@ class GitHubMCPActionAdapter:
         return GitHubActionResult("published", "review_comment", repository, ref.number,
                                   finding_id, github_id=github_id)
 
+    def publish_general_comment(self, ref: PullRequestRef, *, repository: str,
+                                expected_head_sha: str, finding: Mapping[str, Any],
+                                operation_id: Optional[str] = None) -> GitHubActionResult:
+        """Publish a validated finding as an issue comment when no diff line is safe."""
+        finding_id = finding.get("finding_id") if isinstance(finding.get("finding_id"), str) else None
+        if f"{ref.owner}/{ref.repository}".casefold() != str(repository).casefold():
+            return self._result("failed", ref, repository, finding_id, "repository_identity_mismatch")
+        if not _valid_finding(finding):
+            return self._result("skipped_invalid_finding", ref, repository, finding_id,
+                                "finding_validation_failed")
+        try:
+            latest = self.read_client.get_pull(ref)
+        except GitHubPRException as exc:
+            return self._result("failed", ref, repository, finding_id, exc.code)
+        if not _pull_matches(latest, ref, expected_head_sha):
+            return self._result("stale", ref, repository, finding_id, "stale_or_mismatched_pull_request")
+        payload = json.dumps({"body": _comment_body(finding, operation_id=operation_id)},
+                             separators=(",", ":")).encode("utf-8")
+        endpoint = f"{self._repo_path(ref)}/issues/{ref.number}/comments"
+        try:
+            response = self.transport("POST", API_BASE + endpoint, self._headers(), payload)
+        except GitHubPRException as exc:
+            status = "unknown" if exc.code in {"github_timeout", "github_network_error", "github_unavailable"} else "failed"
+            return self._result(status, ref, repository, finding_id, exc.code)
+        github_id = response.get("id") if isinstance(response, dict) and isinstance(response.get("id"), int) else None
+        if github_id is None:
+            return self._result("unknown", ref, repository, finding_id, "github_write_response_unverifiable")
+        return GitHubActionResult("published", "review_comment", repository, ref.number,
+                                  finding_id, github_id=github_id,
+                                  detail={"comment_kind": "general"})
+
     def reconcile_inline_comment(self, ref: PullRequestRef, *, repository: str,
-                                 expected_head_sha: str, operation_id: str) -> dict[str, Any]:
+                                 expected_head_sha: str, operation_id: str,
+                                 comment_kind: str = "inline") -> dict[str, Any]:
         """Check remote state by durable operation marker before any retry."""
         if not re.fullmatch(r"[a-f0-9]{32,64}", operation_id or ""):
             return {"status": "unknown", "error_code": "operation_id_invalid"}
@@ -116,7 +159,10 @@ class GitHubMCPActionAdapter:
             pull = self.read_client.get_pull(ref)
             if not _pull_matches(pull, ref, expected_head_sha):
                 return {"status": "stale", "error_code": "expected_revision_changed"}
-            endpoint = f"{self._repo_path(ref)}/pulls/{ref.number}/comments"
+            if comment_kind not in {"inline", "general"}:
+                return {"status": "unknown", "error_code": "comment_kind_invalid"}
+            endpoint_name = "pulls" if comment_kind == "inline" else "issues"
+            endpoint = f"{self._repo_path(ref)}/{endpoint_name}/{ref.number}/comments"
             marker = f"<!-- ai-code-review-action:{operation_id} -->"
             observed = []
             complete = False
@@ -137,7 +183,7 @@ class GitHubMCPActionAdapter:
                     complete = True
                     break
             matches = [item for item in observed if marker in str(item.get("body", ""))
-                       and item.get("commit_id") == expected_head_sha]
+                       and (comment_kind == "general" or item.get("commit_id") == expected_head_sha)]
             if matches:
                 github_id = matches[0].get("id")
                 return {"status": "published", "github_comment_id": github_id if isinstance(github_id, int) else None,
@@ -213,7 +259,7 @@ class GitHubMCPActionAdapter:
             "changed_lines": changed_lines, "diff": diff,
             "syntax_status": "passed", "static_status": "passed",
             "behavioral_status": "not_run", "ci_status": "not_run",
-            "commit_execution": "AUTONOMOUS_COMMIT_DISABLED",
+            "commit_execution": "requires_independent_runtime_gates",
         }
 
     def prepare_fix_candidate(self, ref: PullRequestRef, *, repository: str,
@@ -245,12 +291,13 @@ class GitHubMCPActionAdapter:
         proposal["verification"] = verification.to_dict()
         proposal["behavioral_status"] = "not_run"
         proposal["ci_status"] = "not_run"
-        proposal["commit_execution"] = "AUTONOMOUS_COMMIT_DISABLED"
+        proposal["commit_execution"] = "requires_independent_runtime_gates"
         return proposal
 
     def verify_candidate_ci(self, ref: PullRequestRef, *, candidate_sha: str,
                             expected_pr_head_sha: str,
-                            required_checks: tuple[str, ...]) -> dict[str, Any]:
+                            required_checks: tuple[str, ...],
+                            expected_workflow_identity: Optional[str] = None) -> dict[str, Any]:
         """Verify named checks on a candidate SHA, never infer from the old PR head."""
         if candidate_sha == expected_pr_head_sha:
             return {"status": "unknown", "candidate_sha": candidate_sha,
@@ -264,10 +311,28 @@ class GitHubMCPActionAdapter:
             if not callable(fetch):
                 return {"status": "unknown", "candidate_sha": candidate_sha,
                         "checks": [], "error_code": "github_ci_reader_unavailable"}
-            report = GitHubCIClient(lambda sha: fetch(ref, sha)).verify(
-                repository=repository, candidate_sha=candidate_sha,
-                required=required_checks,
-            )
+            if expected_workflow_identity is None:
+                ci_fetch = lambda sha: fetch(ref, sha)
+            else:
+                ci_fetch = lambda sha: fetch(ref, sha, expected_workflow_identity)
+            ci_client = GitHubCIClient(ci_fetch)
+            deadline = time.monotonic() + _candidate_ci_wait_seconds()
+            while True:
+                report = ci_client.verify(
+                    repository=f"{ref.owner}/{ref.repository}", candidate_sha=candidate_sha,
+                    required=required_checks,
+                    expected_workflow_identity=expected_workflow_identity,
+                )
+                report_value = report.to_dict()
+                checks = report_value.get("checks", [])
+                awaiting = (report.status == "pending" or
+                            (report.status == "unknown" and any(
+                                isinstance(item, Mapping) and item.get("status") in {"missing", "pending"}
+                                for item in checks)))
+                remaining = deadline - time.monotonic()
+                if not awaiting or remaining <= 0:
+                    break
+                time.sleep(min(1.0, remaining))
             try:
                 latest = self.read_client.get_pull(ref)
             except Exception:
@@ -276,10 +341,49 @@ class GitHubMCPActionAdapter:
             if not _pull_matches(latest, ref, expected_pr_head_sha):
                 return {"status": "unknown", "candidate_sha": candidate_sha,
                         "checks": [], "error_code": "pr_head_changed_during_ci_verification"}
-            return report.to_dict()
+            value = report.to_dict()
+            value["workflow_identity"] = expected_workflow_identity
+            return value
         except Exception as exc:
             return {"status": "unknown", "candidate_sha": candidate_sha,
                     "checks": [], "error_code": f"github_ci_{type(exc).__name__}"}
+
+    def dispatch_candidate_ci(self, ref: PullRequestRef, *, candidate_sha: str,
+                              candidate_branch: str,
+                              workflow_identity: str) -> dict[str, Any]:
+        """Dispatch the owner-configured workflow on the immutable candidate ref."""
+        if not self.staging_enabled or not self.staging_token:
+            return {"status": "blocked", "error_code": "candidate_staging_write_not_enabled"}
+        if (not _full_sha(candidate_sha)
+                or not isinstance(candidate_branch, str)
+                or not re.fullmatch(r"codementor-candidates/[a-f0-9]{32,64}", candidate_branch)
+                or not isinstance(workflow_identity, str)
+                or not re.fullmatch(r"[0-9]{1,20}", workflow_identity)):
+            return {"status": "blocked", "error_code": "candidate_workflow_identity_invalid"}
+        try:
+            ref_result = self._api_call(
+                "GET", self._repo_path(ref) + "/git/ref/heads/" + _quote_branch(candidate_branch),
+                token=self.staging_token,
+            )
+            staged_sha = ref_result.get("object", {}).get("sha") if isinstance(ref_result, dict) else None
+            if staged_sha != candidate_sha:
+                return {"status": "stale", "error_code": "candidate_ref_sha_mismatch"}
+            self._api_call(
+                "POST", self._repo_path(ref) + "/actions/workflows/"
+                + urllib.parse.quote(workflow_identity, safe="") + "/dispatches",
+                {"ref": candidate_branch}, token=self.staging_token,
+            )
+            return {"status": "dispatched", "candidate_sha": candidate_sha,
+                    "candidate_branch": candidate_branch, "workflow_identity": workflow_identity}
+        except GitHubPRException as exc:
+            status = "unknown" if exc.code in {"github_timeout", "github_network_error", "github_unavailable"} else "failed"
+            return {"status": status, "candidate_sha": candidate_sha,
+                    "candidate_branch": candidate_branch, "workflow_identity": workflow_identity,
+                    "error_code": exc.code}
+        except Exception as exc:
+            return {"status": "unknown", "candidate_sha": candidate_sha,
+                    "candidate_branch": candidate_branch, "workflow_identity": workflow_identity,
+                    "error_code": f"workflow_dispatch_{type(exc).__name__}"}
 
     def prepare_commit(self, ref: PullRequestRef, *, repository: str, branch: Optional[str],
                        expected_head_sha: str, is_fork: bool, diff: str,
@@ -318,13 +422,317 @@ class GitHubMCPActionAdapter:
         })
         return gate
 
-    def execute_commit(self, *_args, **_kwargs) -> GitHubActionResult:
-        """Hard-disabled execution gate. J2 intentionally cannot create commits."""
-        return GitHubActionResult(
-            "AUTONOMOUS_COMMIT_DISABLED", "commit", "", 0,
-            error_code="commit_execution_disabled_in_j2",
-            detail={"execution_enabled": False, "force_push": False},
+    def create_candidate_revision(self, ref: PullRequestRef, *, repository: str, branch: str,
+                                  expected_head_sha: str, file_path: str, original_code: str,
+                                  corrected_code: str, operation_id: str) -> dict[str, Any]:
+        """Build and publish a temporary candidate commit without moving the PR ref."""
+        candidate_sha: Optional[str] = None
+        candidate_branch = f"codementor-candidates/{operation_id}" if isinstance(operation_id, str) else None
+        if not self.staging_enabled or not self.staging_token:
+            return {"status": "blocked", "error_code": "candidate_staging_write_not_enabled"}
+        if (f"{ref.owner}/{ref.repository}".casefold() != str(repository).casefold()
+                or not _full_sha(expected_head_sha) or not _safe_changed_path(file_path)
+                or not isinstance(operation_id, str) or not re.fullmatch(r"[a-f0-9]{32,64}", operation_id)
+                or not isinstance(original_code, str) or not isinstance(corrected_code, str)):
+            return {"status": "failed", "error_code": "candidate_identity_invalid"}
+        try:
+            pull = self.read_client.get_pull(ref)
+            if not _pull_matches(pull, ref, expected_head_sha) or pull.get("head", {}).get("ref") != branch:
+                return {"status": "stale", "error_code": "pr_head_changed_before_staging"}
+            head_repo = pull.get("head", {}).get("repo", {})
+            head_owner = head_repo.get("owner", {}).get("login") if isinstance(head_repo, dict) else None
+            head_name = head_repo.get("name") if isinstance(head_repo, dict) else None
+            write_context = self._write_repository_context(ref, self.staging_token)
+            if (f"{head_owner}/{head_name}".casefold() != f"{ref.owner}/{ref.repository}".casefold()
+                    or pull.get("base", {}).get("ref") == branch
+                    or not write_context.get("push")
+                    or branch == write_context.get("default_branch")):
+                return {"status": "blocked", "error_code": "candidate_repository_or_branch_not_writable"}
+            source = self.read_client.get_file(ref, file_path, expected_head_sha, max_source_bytes=256 * 1024)
+            if source != original_code:
+                return {"status": "stale", "error_code": "original_source_mismatch"}
+            path = self._repo_path(ref)
+            candidate_branch = f"codementor-candidates/{operation_id}"
+            try:
+                existing_ref = self._api_call(
+                    "GET", path + "/git/ref/heads/" + _quote_branch(candidate_branch),
+                    token=self.staging_token,
+                )
+            except GitHubPRException as exc:
+                if exc.code != "github_not_found":
+                    raise
+                existing_ref = None
+            if isinstance(existing_ref, dict):
+                existing_sha = existing_ref.get("object", {}).get("sha")
+                if not _full_sha(existing_sha):
+                    return {"status": "unknown", "candidate_branch": candidate_branch,
+                            "error_code": "existing_candidate_ref_invalid"}
+                existing_commit = self._api_call(
+                    "GET", path + "/git/commits/" + urllib.parse.quote(existing_sha, safe=""),
+                    token=self.staging_token,
+                )
+                parents = existing_commit.get("parents") if isinstance(existing_commit, dict) else None
+                parent_shas = [item.get("sha") for item in parents if isinstance(item, dict)] if isinstance(parents, list) else []
+                existing_source = self.read_client.get_file(ref, file_path, existing_sha, max_source_bytes=256 * 1024)
+                if parent_shas == [expected_head_sha] and existing_source == corrected_code:
+                    return {"status": "created", "repository": repository, "candidate_sha": existing_sha,
+                            "candidate_branch": candidate_branch, "parent_sha": expected_head_sha,
+                            "path": file_path,
+                            "source_sha256": hashlib.sha256(corrected_code.encode("utf-8")).hexdigest(),
+                            "operation_id": operation_id, "idempotent_replay": True}
+                return {"status": "unknown", "candidate_sha": existing_sha,
+                        "candidate_branch": candidate_branch, "error_code": "candidate_ref_conflict"}
+            blob = self._api_call("POST", path + "/git/blobs",
+                                  {"content": corrected_code, "encoding": "utf-8"}, token=self.staging_token)
+            blob_sha = blob.get("sha") if isinstance(blob, dict) else None
+            if not _full_sha(blob_sha):
+                return {"status": "failed", "error_code": "candidate_blob_invalid"}
+            parent_commit = self._api_call("GET", path + "/git/commits/" + urllib.parse.quote(expected_head_sha, safe=""),
+                                           token=self.staging_token)
+            base_tree = parent_commit.get("tree", {}).get("sha") if isinstance(parent_commit, dict) else None
+            if not _full_sha(base_tree):
+                return {"status": "failed", "error_code": "candidate_parent_tree_invalid"}
+            tree = self._api_call("POST", path + "/git/trees", {
+                "base_tree": base_tree,
+                "tree": [{"path": file_path, "mode": "100644", "type": "blob", "sha": blob_sha}],
+            }, token=self.staging_token)
+            tree_sha = tree.get("sha") if isinstance(tree, dict) else None
+            entries = tree.get("tree") if isinstance(tree, dict) else None
+            if not _full_sha(tree_sha) or not isinstance(entries, list) or not any(
+                    isinstance(item, dict) and item.get("path") == file_path and item.get("sha") == blob_sha
+                    for item in entries):
+                return {"status": "failed", "error_code": "candidate_tree_invalid"}
+            commit = self._api_call("POST", path + "/git/commits", {
+                "message": f"CodeMentor candidate {operation_id}", "tree": tree_sha,
+                "parents": [expected_head_sha],
+            }, token=self.staging_token)
+            candidate_sha = commit.get("sha") if isinstance(commit, dict) else None
+            parents = commit.get("parents") if isinstance(commit, dict) else None
+            if (not _full_sha(candidate_sha) or not isinstance(parents, list)
+                    or [item.get("sha") for item in parents if isinstance(item, dict)] != [expected_head_sha]):
+                return {"status": "failed", "error_code": "candidate_commit_invalid"}
+            candidate_ref = self._api_call("POST", path + "/git/refs", {
+                "ref": "refs/heads/" + candidate_branch, "sha": candidate_sha,
+            }, token=self.staging_token)
+            created_sha = candidate_ref.get("object", {}).get("sha") if isinstance(candidate_ref, dict) else None
+            if created_sha != candidate_sha:
+                return {"status": "unknown", "candidate_sha": candidate_sha,
+                        "candidate_branch": candidate_branch, "error_code": "candidate_ref_write_unconfirmed"}
+            return {"status": "created", "repository": repository, "candidate_sha": candidate_sha,
+                    "candidate_branch": candidate_branch, "parent_sha": expected_head_sha,
+                    "tree_sha": tree_sha, "blob_sha": blob_sha, "path": file_path,
+                    "source_sha256": hashlib.sha256(corrected_code.encode("utf-8")).hexdigest(),
+                    "operation_id": operation_id}
+        except GitHubPRException as exc:
+            status = "unknown" if exc.code in {"github_timeout", "github_network_error", "github_unavailable"} else "failed"
+            return {"status": status, "error_code": exc.code,
+                    "candidate_sha": candidate_sha, "candidate_branch": candidate_branch,
+                    "parent_sha": expected_head_sha, "operation_id": operation_id}
+        except Exception as exc:
+            return {"status": "unknown", "error_code": f"candidate_{type(exc).__name__}",
+                    "candidate_sha": candidate_sha, "candidate_branch": candidate_branch,
+                    "parent_sha": expected_head_sha, "operation_id": operation_id}
+
+    def reconcile_candidate_revision(self, ref: PullRequestRef, *, repository: str,
+                                     operation_id: str, expected_candidate_sha: Optional[str]) -> dict[str, Any]:
+        """Observe an uncertain temporary-ref write; never delete or retry it."""
+        if (f"{ref.owner}/{ref.repository}".casefold() != str(repository).casefold()
+                or not isinstance(operation_id, str)
+                or not re.fullmatch(r"[a-f0-9]{32,64}", operation_id)):
+            return {"status": "unknown", "error_code": "candidate_reconciliation_identity_invalid"}
+        if not self.staging_token:
+            return {"status": "unknown", "error_code": "candidate_reconciliation_token_unavailable"}
+        candidate_branch = f"codementor-candidates/{operation_id}"
+        try:
+            result = self._api_call("GET", self._repo_path(ref) + "/git/ref/heads/" + _quote_branch(candidate_branch),
+                                    token=self.staging_token)
+            sha = result.get("object", {}).get("sha") if isinstance(result, dict) else None
+            if not _full_sha(sha):
+                return {"status": "unknown", "error_code": "candidate_ref_response_invalid"}
+            if expected_candidate_sha and sha != expected_candidate_sha:
+                return {"status": "unknown", "error_code": "candidate_ref_sha_mismatch"}
+            return {"status": "candidate_staged", "candidate_branch": candidate_branch,
+                    "candidate_sha": sha, "cleanup": "not_attempted"}
+        except GitHubPRException as exc:
+            if exc.code == "github_not_found":
+                return {"status": "not_staged", "retry_safe": True}
+            return {"status": "unknown", "error_code": exc.code}
+        except Exception as exc:
+            return {"status": "unknown", "error_code": f"candidate_reconciliation_{type(exc).__name__}"}
+
+    def reconcile_commit(self, ref: PullRequestRef, *, repository: str, branch: str,
+                         expected_head_sha: str, candidate_sha: str) -> dict[str, Any]:
+        """Read remote refs after an ambiguous final update; never write/retry."""
+        if (f"{ref.owner}/{ref.repository}".casefold() != str(repository).casefold()
+                or not _full_sha(expected_head_sha) or not _full_sha(candidate_sha)
+                or not isinstance(branch, str)):
+            return {"status": "unknown", "error_code": "commit_reconciliation_identity_invalid"}
+        if not self.commit_token:
+            return {"status": "unknown", "error_code": "commit_reconciliation_token_unavailable"}
+        try:
+            pull = self.read_client.get_pull(ref)
+            if not _pull_matches(pull, ref, None) or pull.get("head", {}).get("ref") != branch:
+                return {"status": "stale", "error_code": "pull_or_branch_identity_changed"}
+            current = self._api_call("GET", self._repo_path(ref) + "/git/ref/heads/" + _quote_branch(branch),
+                                     token=self.commit_token)
+            current_sha = current.get("object", {}).get("sha") if isinstance(current, dict) else None
+            head_sha = pull.get("head", {}).get("sha")
+            if current_sha == candidate_sha and head_sha == candidate_sha:
+                return {"status": "published", "commit_sha": candidate_sha}
+            if current_sha == expected_head_sha and head_sha == expected_head_sha:
+                return {"status": "not_published", "retry_safe": True,
+                        "error_code": "remote_ref_still_at_expected_head"}
+            return {"status": "unknown", "error_code": "remote_commit_state_conflicted"}
+        except GitHubPRException as exc:
+            return {"status": "unknown", "error_code": exc.code}
+        except Exception as exc:
+            return {"status": "unknown", "error_code": f"commit_reconciliation_{type(exc).__name__}"}
+
+    def execute_commit(self, *_args, **kwargs) -> GitHubActionResult:
+        """Finalize an exact candidate only after all independent gates pass.
+
+        Ref updates have no general compare-and-swap field. The candidate is
+        required to have the captured head as its only parent, the PR and ref
+        are checked immediately before PATCH, and `force:false` makes a race
+        with a new PR commit fail as non-fast-forward rather than overwrite it.
+        """
+        ref, repository, branch = kwargs.get("ref"), kwargs.get("repository"), kwargs.get("branch")
+        expected, candidate_sha = kwargs.get("expected_head_sha"), kwargs.get("candidate_sha")
+        pr_number = ref.number if isinstance(ref, PullRequestRef) else 0
+        if not self.commit_enabled or not self.commit_token:
+            return self._commit_result("AUTONOMOUS_COMMIT_DISABLED", repository, pr_number,
+                                       "final_commit_write_not_enabled")
+        gates = kwargs.get("gates")
+        required_gates = {"repository_opt_in", "eligible_low_risk_category", "calibration_supported",
+                          "source_hashes_valid", "syntax_passed", "static_passed", "behavioral_passed",
+                          "candidate_ci_passed", "scope_valid", "write_permission_valid",
+                          "durable_record_reserved", "idempotency_reserved"}
+        if (not isinstance(ref, PullRequestRef) or not isinstance(gates, Mapping)
+                or any(gates.get(key) is not True for key in required_gates)):
+            return self._commit_result("blocked", repository, pr_number, "required_gate_not_passed")
+        operation_id, file_path = kwargs.get("operation_id"), kwargs.get("file_path")
+        corrected_code, is_fork = kwargs.get("corrected_code"), kwargs.get("is_fork", False)
+        if (not _full_sha(expected) or not _full_sha(candidate_sha)
+                or not isinstance(operation_id, str) or not re.fullmatch(r"[a-f0-9]{32,64}", operation_id)
+                or not isinstance(file_path, str) or not _safe_changed_path(file_path)
+                or not isinstance(corrected_code, str) or not isinstance(branch, str) or is_fork is not False):
+            return self._commit_result("blocked", repository, pr_number, "commit_identity_invalid")
+        if (not _verified_behavioral_evidence(kwargs.get("behavioral_evidence"), corrected_code)
+                or not _verified_ci_evidence(kwargs.get("ci_evidence"), candidate_sha,
+                                             kwargs.get("required_checks", ()))
+                or not _verified_confidence_evidence(kwargs.get("confidence_evidence"),
+                                                      kwargs.get("confidence_threshold", 0.80))):
+            return self._commit_result("blocked", repository, ref.number, "verification_evidence_invalid")
+        confidence_evidence = kwargs["confidence_evidence"]
+        decision_gates = dict(gates)
+        decision_gates.update({
+            "confidence": confidence_evidence["calibrated_confidence"],
+            "changed_lines": kwargs.get("changed_lines"),
+            "candidate_sha": candidate_sha,
+            "ci_sha": kwargs["ci_evidence"]["candidate_sha"],
+            "unexpected_files": kwargs.get("unexpected_files", []),
+        })
+        decision = commit_execution_decision(
+            repository=repository, branch=branch, expected_head_sha=expected,
+            current_head_sha=expected, is_fork=False,
+            protected_branches=tuple(kwargs.get("protected_branches", ("main", "master"))),
+            gates=decision_gates, execution_authorized=True,
         )
+        if decision.get("eligible") is not True:
+            return self._commit_result("blocked", repository, ref.number, "commit_policy_denied")
+        if (not isinstance(kwargs.get("changed_lines"), int) or isinstance(kwargs.get("changed_lines"), bool)
+                or not 1 <= kwargs["changed_lines"] <= 3
+                or not isinstance(kwargs.get("permitted_branches"), (list, tuple))
+                or branch not in kwargs["permitted_branches"]
+                or kwargs.get("unexpected_files", []) not in ([], ())):
+            return self._commit_result("blocked", repository, ref.number, "commit_scope_or_line_limit_invalid")
+        try:
+            pull = self.read_client.get_pull(ref)
+            if not _pull_matches(pull, ref, expected):
+                if (pull.get("head", {}).get("sha") == candidate_sha
+                        and pull.get("head", {}).get("ref") == branch):
+                    current_ref = self._api_call(
+                        "GET", self._repo_path(ref) + "/git/ref/heads/" + _quote_branch(branch),
+                        token=self.commit_token,
+                    )
+                    if isinstance(current_ref, dict) and current_ref.get("object", {}).get("sha") == candidate_sha:
+                        return GitHubActionResult("published", "commit", repository, ref.number,
+                                                  commit_sha=candidate_sha,
+                                                  detail={"operation_id": operation_id, "idempotent_replay": True})
+                return self._commit_result("stale", repository, ref.number, "pr_head_changed")
+            head, base = pull.get("head", {}), pull.get("base", {})
+            if head.get("ref") != branch or base.get("ref") == branch:
+                return self._commit_result("blocked", repository, ref.number, "branch_identity_or_base_branch_invalid")
+            write_context = self._write_repository_context(ref, self.commit_token)
+            if not write_context.get("push") or branch == write_context.get("default_branch"):
+                return self._commit_result("blocked", repository, ref.number, "repository_write_permission_unverified")
+            head_repo = head.get("repo", {})
+            head_owner = head_repo.get("owner", {}).get("login") if isinstance(head_repo, dict) else None
+            head_name = head_repo.get("name") if isinstance(head_repo, dict) else None
+            if f"{head_owner}/{head_name}".casefold() != f"{ref.owner}/{ref.repository}".casefold():
+                return self._commit_result("blocked", repository, ref.number, "fork_write_not_authorized")
+            candidate_source = self.read_client.get_file(ref, file_path, candidate_sha,
+                                                         max_source_bytes=256 * 1024)
+            if candidate_source != corrected_code:
+                return self._commit_result("blocked", repository, ref.number, "candidate_content_mismatch")
+            repo_path = self._repo_path(ref)
+            commit = self._api_call("GET", repo_path + "/git/commits/" + urllib.parse.quote(candidate_sha, safe=""),
+                                    token=self.commit_token)
+            parents = commit.get("parents") if isinstance(commit, dict) else None
+            parent_shas = [item.get("sha") for item in parents if isinstance(item, dict)] if isinstance(parents, list) else []
+            if parent_shas != [expected]:
+                return self._commit_result("blocked", repository, ref.number, "candidate_parent_mismatch")
+            latest = self.read_client.get_pull(ref)
+            if not _pull_matches(latest, ref, expected) or latest.get("head", {}).get("ref") != branch:
+                return self._commit_result("stale", repository, ref.number, "pr_head_changed_before_finalize")
+            encoded_branch = _quote_branch(branch)
+            current_ref = self._api_call("GET", repo_path + "/git/ref/heads/" + encoded_branch,
+                                         token=self.commit_token)
+            current_sha = current_ref.get("object", {}).get("sha") if isinstance(current_ref, dict) else None
+            if current_sha == candidate_sha:
+                return GitHubActionResult("published", "commit", repository, ref.number,
+                                          commit_sha=candidate_sha,
+                                          detail={"operation_id": operation_id, "idempotent_replay": True})
+            if current_sha != expected:
+                return self._commit_result("stale", repository, ref.number, "branch_ref_changed")
+            updated = self._api_call("PATCH", repo_path + "/git/refs/heads/" + encoded_branch,
+                                     {"sha": candidate_sha, "force": False}, token=self.commit_token)
+            updated_sha = updated.get("object", {}).get("sha") if isinstance(updated, dict) else None
+            if updated_sha != candidate_sha:
+                return self._commit_result("unknown", repository, ref.number, "commit_write_response_unverifiable")
+            return GitHubActionResult("published", "commit", repository, ref.number,
+                                      commit_sha=candidate_sha,
+                                      detail={"operation_id": operation_id, "force_push": False})
+        except GitHubPRException as exc:
+            status = ("unknown" if exc.code in {"github_timeout", "github_network_error", "github_unavailable"}
+                      else "stale" if exc.code == "github_non_fast_forward" else "failed")
+            return self._commit_result(status, repository, ref.number, exc.code)
+        except Exception as exc:
+            return self._commit_result("unknown", repository, ref.number, f"commit_{type(exc).__name__}")
+
+    def _api_call(self, method: str, path: str, payload: Optional[Mapping[str, Any]] = None,
+                  *, token: Optional[str]) -> Any:
+        body = json.dumps(payload or {}, separators=(",", ":")).encode("utf-8") if method != "GET" else b""
+        return self.transport(method, API_BASE + path, self._headers(token=token), body)
+
+    def _write_repository_context(self, ref: PullRequestRef, token: Optional[str]) -> dict[str, Any]:
+        if not token:
+            return {"push": False}
+        try:
+            value = self._api_call("GET", self._repo_path(ref), token=token)
+        except Exception:
+            return {"push": False}
+        full_name = value.get("full_name") if isinstance(value, dict) else None
+        if not isinstance(full_name, str) or full_name.casefold() != f"{ref.owner}/{ref.repository}".casefold():
+            return {"push": False}
+        permissions = value.get("permissions")
+        return {"push": isinstance(permissions, Mapping) and permissions.get("push") is True,
+                "default_branch": value.get("default_branch")}
+
+    @staticmethod
+    def _commit_result(status: str, repository: Any, pr_number: int, error_code: str) -> GitHubActionResult:
+        return GitHubActionResult(status, "commit", str(repository or ""), pr_number,
+                                  error_code=error_code, detail={"force_push": False})
 
     def _revision_current(self, ref: PullRequestRef, expected_head_sha: str) -> bool:
         try:
@@ -345,21 +753,22 @@ class GitHubMCPActionAdapter:
     def _repo_path(ref: PullRequestRef) -> str:
         return f"/repos/{urllib.parse.quote(ref.owner, safe='')}/{urllib.parse.quote(ref.repository, safe='')}"
 
-    def _headers(self) -> dict[str, str]:
+    def _headers(self, *, token: Optional[str] = None) -> dict[str, str]:
         headers = {
             "Accept": "application/vnd.github+json", "Content-Type": "application/json",
             "User-Agent": "AI-Code-Reviewer-MCP-Actions", "X-GitHub-Api-Version": API_VERSION,
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
+        credential = token if token is not None else self.token
+        if credential:
+            headers["Authorization"] = f"Bearer {credential}"
         return headers
 
     def _request(self, method: str, url: str, headers: Mapping[str, str], body: bytes) -> Any:
         parsed = urllib.parse.urlsplit(url)
-        if (method not in {"POST", "GET"} or parsed.scheme != "https" or parsed.netloc != "api.github.com"
-                or not parsed.path.startswith("/repos/") or (method == "POST" and not self.token)):
+        if (method not in {"POST", "GET", "PATCH"} or parsed.scheme != "https" or parsed.netloc != "api.github.com"
+                or not parsed.path.startswith("/repos/") or (method in {"POST", "PATCH"} and "Authorization" not in headers)):
             raise GitHubPRException("github_action_not_authorized", 403, "GitHub action is not authorized.")
-        request = urllib.request.Request(url, data=body if method == "POST" else None,
+        request = urllib.request.Request(url, data=body if method != "GET" else None,
                                          headers=dict(headers), method=method)
         try:
             opener = urllib.request.build_opener(_NoRedirect())
@@ -379,7 +788,11 @@ class GitHubMCPActionAdapter:
             elif exc.code == 404:
                 code = "github_not_found"
             elif exc.code == 422:
-                code = "github_action_rejected"
+                try:
+                    error_text = exc.read(4096).decode("utf-8", errors="replace").casefold()
+                except Exception:
+                    error_text = ""
+                code = "github_non_fast_forward" if "not a fast forward" in error_text else "github_action_rejected"
             elif exc.code >= 500:
                 code = "github_unavailable"
             else:
@@ -454,3 +867,85 @@ def _comment_body(finding: Mapping[str, Any], *, operation_id: Optional[str] = N
     if isinstance(operation_id, str) and re.fullmatch(r"[a-f0-9]{32,64}", operation_id):
         lines.append(f"\n<!-- ai-code-review-action:{operation_id} -->")
     return "\n".join(lines)[:6000]
+
+
+def _explicit_env_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().casefold() in {"1", "true", "yes"}
+
+
+def _full_sha(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"[0-9a-fA-F]{40,64}", value))
+
+
+def _quote_branch(branch: str) -> str:
+    if (not isinstance(branch, str) or not branch or branch.startswith("/")
+            or branch.endswith("/") or ".." in branch.split("/")
+            or any(part in {"", "."} for part in branch.split("/"))
+            or any(ord(char) < 32 for char in branch)):
+        raise ValueError("branch_name_invalid")
+    return "/".join(urllib.parse.quote(part, safe="") for part in branch.split("/"))
+
+
+def _repo_write_permission(read_client: Any, ref: PullRequestRef) -> bool:
+    getter = getattr(read_client, "get_repository", None)
+    if not callable(getter):
+        return False
+    try:
+        repository = getter(ref.owner, ref.repository)
+    except Exception:
+        return False
+    if not isinstance(repository, Mapping):
+        return False
+    actual = repository.get("full_name")
+    permissions = repository.get("permissions")
+    return (isinstance(actual, str) and actual.casefold() == f"{ref.owner}/{ref.repository}".casefold()
+            and isinstance(permissions, Mapping) and permissions.get("push") is True)
+
+
+def _verified_behavioral_evidence(evidence: Any, corrected_code: str) -> bool:
+    if not isinstance(evidence, Mapping):
+        return False
+    expected = hashlib.sha256(corrected_code.encode("utf-8")).hexdigest()
+    return (evidence.get("status") == "passed" and evidence.get("candidate_sha256") == expected
+            and evidence.get("executed") is True and evidence.get("exit_code") == 0
+            and isinstance(evidence.get("test_identity"), str) and bool(evidence["test_identity"])
+            and isinstance(evidence.get("verifier_id"), str) and bool(evidence["verifier_id"])
+            and evidence.get("attestation_verified") is True)
+
+
+def _verified_ci_evidence(evidence: Any, candidate_sha: str, required_checks: Any) -> bool:
+    if not isinstance(evidence, Mapping) or evidence.get("status") != "passed" or evidence.get("candidate_sha") != candidate_sha:
+        return False
+    required = tuple(item for item in required_checks if isinstance(item, str)) if isinstance(required_checks, (tuple, list)) else ()
+    checks = evidence.get("checks")
+    if not required or not isinstance(checks, list):
+        return False
+    by_name = {item.get("name"): item for item in checks if isinstance(item, Mapping)}
+    return all(name in by_name and by_name[name].get("status") == "success"
+               and by_name[name].get("head_sha") == candidate_sha
+               and by_name[name].get("workflow_identity") == evidence.get("workflow_identity")
+               for name in required) and isinstance(evidence.get("workflow_identity"), str)
+
+
+def _verified_confidence_evidence(evidence: Any, threshold: Any) -> bool:
+    if not isinstance(evidence, Mapping):
+        return False
+    confidence = evidence.get("calibrated_confidence")
+    return (evidence.get("calibrated") is True and evidence.get("manifest_verified") is True
+            and isinstance(evidence.get("model_id"), str) and isinstance(evidence.get("dataset_id"), str)
+            and isinstance(evidence.get("finding_category"), str)
+            and isinstance(evidence.get("artifact_sha256"), str)
+            and isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+            and isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
+            and float(confidence) >= max(0.80, float(threshold)))
+
+
+def _candidate_ci_wait_seconds() -> float:
+    """Bounded wait for a dispatched candidate workflow; zero disables polling."""
+    try:
+        configured = float(os.getenv("GITHUB_CANDIDATE_CI_WAIT_SECONDS", "60"))
+    except (TypeError, ValueError):
+        configured = 60.0
+    if not (configured >= 0 and configured < float("inf")):
+        configured = 60.0
+    return min(configured, 180.0)

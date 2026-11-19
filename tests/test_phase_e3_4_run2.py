@@ -120,6 +120,9 @@ def test_preparation_copies_only_v3_and_pins_shared_snapshot_for_both_arms(
 def test_resume_preflight_refreshes_dashboard_quota_without_chroma_or_provider_calls(
     tmp_path, monkeypatch
 ):
+    # The preflight checks only whether a key is configured. It never creates
+    # a provider client or sends a request; keep this fixture hermetic in CI.
+    monkeypatch.setenv("GROQ_API_KEY", "synthetic-test-key-no-provider-call")
     run_dir = tmp_path / "phase_e3_4_run2"
     run_dir.mkdir()
     (run_dir / "preflight.json").write_text(json.dumps({
@@ -191,6 +194,48 @@ def test_resume_preflight_refreshes_dashboard_quota_without_chroma_or_provider_c
     assert report["next_batch"]["requests_planned_for_next_invocation"] == 29
     assert report["next_batch"]["estimated_batch_tokens"] == (50000 // 60) * 29
     assert report["next_batch"]["permitted"] is True
+    assert report["network"] == {"status": "not_probed", "live_requests_made": 0}
+
+
+def test_preflight_blocks_when_groq_credentials_are_missing(tmp_path, monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    run_dir = tmp_path / "phase_e3_4_run2"
+    run_dir.mkdir()
+    monkeypatch.setattr(run2, "_load_run_manifest", lambda _path: {
+        "manifest_sha256": "a" * 64,
+        "selected_arms": ["no_rag"],
+        "references": {},
+    })
+    monkeypatch.setattr(run2, "_plan_identity", lambda **_kwargs: {"selected_arms": ["no_rag"]})
+    monkeypatch.setattr(run2, "load_cases", lambda: [{"case_id": "CASE-00"}])
+    monkeypatch.setattr(run2, "_build_quota_projection", lambda **_kwargs: {
+        "selected_arms": ["no_rag"],
+        "planned_requests": 1,
+        "projected_total_tokens": 100,
+        "initial_projected_total_tokens": 100,
+        "remaining_daily_tokens_reported_by_user_from_provider_dashboard": 1000,
+        "reserved_daily_budget_after_safety_margin": 800,
+        "projected_within_daily_budget": True,
+        "maximum_projected_single_request_tokens": 100,
+        "conservative_minute_token_budget": 6400,
+        "projected_requests_fit_minute_token_budget": True,
+        "per_arm": {"no_rag": {"per_case": [
+            {"case_id": "CASE-00", "total_tokens_reserved": 100},
+        ]}},
+    })
+
+    report = run2.run_preflight(
+        snapshot_root=tmp_path / "unused-snapshots",
+        working_root=tmp_path / "unused-working",
+        run_dir=run_dir,
+        remaining_daily_tokens=1000,
+        arms=("no_rag",),
+    )
+
+    assert report["status"] == "blocked"
+    assert report["execution_permitted"] is False
+    assert "GROQ_API_KEY is not configured" in report["blocked_reasons"]
+    assert report["provider"]["credentials_present"] is False
     assert report["network"] == {"status": "not_probed", "live_requests_made": 0}
 
 

@@ -235,8 +235,9 @@ class GitHubRESTClient:
                 raise GitHubPRException("github_repository_mismatch", 502, "GitHub returned a pull request for a different repository.")
         return payload
 
-    def get_ci_evidence(self, ref: PullRequestRef, commit_sha: str) -> dict[str, Any]:
-        """Read check runs and commit statuses for one exact revision only."""
+    def get_ci_evidence(self, ref: PullRequestRef, commit_sha: str,
+                        expected_workflow_identity: Optional[str] = None) -> dict[str, Any]:
+        """Read checks and bind Actions checks to a successful exact-SHA workflow run."""
         if not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha):
             raise GitHubPRException("invalid_commit_sha", 422, "A full commit SHA is required for CI verification.")
         encoded = urllib.parse.quote(commit_sha, safe="")
@@ -246,8 +247,36 @@ class GitHubRESTClient:
         if (not isinstance(check_payload, dict) or not isinstance(check_payload.get("check_runs"), list)
                 or not isinstance(status_payload, dict) or not isinstance(status_payload.get("statuses"), list)):
             raise GitHubPRException("github_ci_response_invalid", 502, "GitHub returned incomplete CI status data.")
+        check_runs = [dict(item) for item in check_payload["check_runs"] if isinstance(item, dict)]
+        if expected_workflow_identity is not None:
+            if not re.fullmatch(r"[0-9]{1,20}", expected_workflow_identity):
+                raise GitHubPRException("github_workflow_identity_invalid", 422,
+                                        "A numeric GitHub workflow ID is required.")
+            workflow_payload, _ = self._get(
+                f"{self._repo_path(ref)}/actions/workflows/{expected_workflow_identity}/runs",
+                {"head_sha": commit_sha, "per_page": "100"},
+            )
+            runs = workflow_payload.get("workflow_runs") if isinstance(workflow_payload, dict) else None
+            if not isinstance(runs, list):
+                raise GitHubPRException("github_workflow_runs_invalid", 502,
+                                        "GitHub returned incomplete workflow-run data.")
+            successful_suite_ids = {
+                item.get("check_suite_id") for item in runs
+                if isinstance(item, dict)
+                and item.get("workflow_id") == int(expected_workflow_identity)
+                and item.get("head_sha") == commit_sha
+                and item.get("event") == "workflow_dispatch"
+                and item.get("status") == "completed"
+                and item.get("conclusion") == "success"
+                and isinstance(item.get("check_suite_id"), int)
+            }
+            for check_run in check_runs:
+                suite = check_run.get("check_suite")
+                suite_id = suite.get("id") if isinstance(suite, dict) else None
+                if suite_id in successful_suite_ids:
+                    check_run["workflow_identity"] = expected_workflow_identity
         return {"head_sha": check_payload.get("sha"),
-                "check_runs": check_payload["check_runs"],
+                "check_runs": check_runs,
                 "statuses": [dict(item, sha=commit_sha) for item in status_payload["statuses"]
                              if isinstance(item, dict)]}
 
@@ -527,9 +556,14 @@ class PRFileResult:
     static_analysis_status: str = "not_run"
     static_analysis_error: Optional[dict[str, Any]] = None
     repository_context: dict[str, Any] = field(default_factory=dict)
+    _source_code: Optional[str] = field(default=None, repr=False, compare=False)
+    _validated_response: Optional[ReviewResponse] = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        result = asdict(self)
+        result.pop("_source_code", None)
+        result.pop("_validated_response", None)
+        return result
 
 
 @dataclass
@@ -722,6 +756,10 @@ class GitHubPRReviewService:
                 continue
 
             result.review_summary = response.summary
+            # Keep validated raw-response context only in memory for the
+            # authorized fix generator. It is omitted from API/ledger payloads.
+            result._source_code = head_source
+            result._validated_response = response
             result.evidence = [asdict(evidence) for evidence in response.evidence]
             result.static_analysis_status = response.static_analysis_status
             result.static_analysis_error = response.static_analysis_error

@@ -6,8 +6,10 @@ import os
 import time
 import uuid
 import hmac
+import stat
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from pathlib import Path
 from threading import BoundedSemaphore, RLock
 from typing import Literal, Optional
 
@@ -92,7 +94,7 @@ class AdminRecoveryRequest(BaseModel):
 
 class GitHubCredentialRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    credential_type: Literal["github_token", "github_actions_token", "webhook_secret"]
+    credential_type: Literal["github_token", "github_actions_token", "github_candidate_staging_token", "github_autonomous_commit_token", "webhook_secret"]
     value: str = Field(min_length=1, max_length=4096)
     persistent: bool = True
 
@@ -289,7 +291,7 @@ class ReviewFixService:
         )
         if candidate.generation_status == "generated":
             from dataclasses import replace
-            candidate = replace(candidate, provider_identity=self.provider_identity("fix"))
+            candidate = replace(candidate, provider_identity=self.provider_identity("fix"), review_id=review_id)
         if candidate.generation_status == "generated":
             self.state.put_candidate(candidate)
         return candidate
@@ -307,17 +309,17 @@ class ReviewFixService:
         self.state.put_candidate(record_verification(candidate, report))
         return report
 
-    def accept(self, candidate_id: str):
-        return self._approval(candidate_id, orchestrator.accept_fix)
+    def accept(self, candidate_id: str, *, actor_id: str):
+        return self._approval(candidate_id, orchestrator.accept_fix, actor_id=actor_id)
 
-    def reject(self, candidate_id: str):
-        return self._approval(candidate_id, orchestrator.reject_fix)
+    def reject(self, candidate_id: str, *, actor_id: str):
+        return self._approval(candidate_id, orchestrator.reject_fix, actor_id=actor_id)
 
-    def _approval(self, candidate_id: str, action):
+    def _approval(self, candidate_id: str, action, *, actor_id: str):
         candidate = self.get_candidate(candidate_id)
         if candidate is None:
             raise LookupError("candidate_not_found")
-        result = action(candidate)
+        result = action(candidate, actor_id=actor_id)
         self.state.put_candidate(result.candidate)
         return result
 
@@ -367,11 +369,65 @@ def create_app(service: Optional[ReviewFixService] = None,
         delivery_store,
         read_client=getattr(getattr(lifecycle, "github_pr_service", None), "client", None),
     )
+    from mcp_server.autonomous_fixes import AutonomousFixExecutor
+    from mcp_server.behavioral_verification import BehavioralVerifier, RemoteHTTPSExecutionBroker
+
+    def _confidence_for_finding(finding):
+        from mcp_server.confidence import load_runtime_confidence
+        calibration_path = os.getenv("AI_CODE_REVIEWER_RUNTIME_CALIBRATION_PATH")
+        dataset_id = os.getenv("AI_CODE_REVIEWER_CALIBRATION_DATASET_ID")
+        model_id = lifecycle.provider_identity("review")
+        if not calibration_path or not dataset_id:
+            return None
+        return load_runtime_confidence(
+            calibration_path, model_id=model_id, dataset_id=dataset_id,
+            finding_category=str(finding.get("issue_type", "")),
+        )
+
+    def _generate_autonomous_fix(review_response, finding_id, source):
+        from mcp_server import orchestrator
+        return orchestrator.generate_fix_candidate(
+            review_response, finding_id, source, llm=lifecycle._get_provider("fix"),
+        )
+
+    def _behavioral_tests(_path):
+        test_path = os.getenv("AI_CODE_REVIEWER_BEHAVIORAL_TEST_BUNDLE")
+        if not test_path:
+            return None
+        target = Path(test_path).expanduser()
+        try:
+            info = target.lstat()
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_size > 2 * 1024 * 1024):
+                return None
+            return target.read_bytes()
+        except OSError:
+            return None
+
+    broker = (RemoteHTTPSExecutionBroker()
+              if os.getenv("AI_CODE_REVIEWER_SANDBOX_URL") and os.getenv("AI_CODE_REVIEWER_SANDBOX_HMAC_KEY")
+              else None)
+    action_coordinator.autonomous_executor = AutonomousFixExecutor(
+        store=delivery_store, adapter=action_coordinator.adapter,
+        fix_generator=_generate_autonomous_fix,
+        confidence_resolver=_confidence_for_finding,
+        behavioral_verifier=BehavioralVerifier(broker) if broker else None,
+        behavioral_tests=_behavioral_tests,
+    )
 
     def process_webhook_event(event):
         _apply_github_credentials(lifecycle, credential_store, action_coordinator, include_action=True)
         from mcp_server.github_policy import load_repository_action_config
         action_coordinator.configs = load_repository_action_config()
+        repository = f"{event.get('owner', '')}/{event.get('repository', '')}"
+        if delivery_store.is_codementor_commit(repository, str(event.get("head_sha", ""))):
+            # A confirmed CodeMentor-authored commit may generate a
+            # synchronize event. Persist a terminal suppression result rather
+            # than recursively reviewing and generating another fix.
+            return {"repository": repository, "number": event.get("number"),
+                    "head_sha": event.get("head_sha"), "completion_status": "complete",
+                    "self_generated_commit_suppressed": True, "files": [],
+                    "action_processing": {"mode": "suppressed_self_generated_commit", "actions": []}}
         return _run_webhook_review(lifecycle, event, action_coordinator)
 
     processor = webhook_processor or GitHubWebhookProcessor(
@@ -382,6 +438,13 @@ def create_app(service: Optional[ReviewFixService] = None,
     @asynccontextmanager
     async def lifespan(_app):
         bootstrap = auth_store.startup()
+        # Fail startup before accepting traffic if durable application state is
+        # unavailable. Both stores open SQLite connections per operation and
+        # close them in their connection context managers; no connection is
+        # retained by the application lifespan.
+        if lifecycle.state.persistence_store is not None:
+            lifecycle.state.persistence_store.initialize()
+        delivery_store.initialize()
         _print_startup_summary(auth_store, credential_store, bootstrap)
         try:
             webhook_configured = bool(credential_store.get("webhook_secret"))
@@ -426,16 +489,27 @@ def create_app(service: Optional[ReviewFixService] = None,
         if auth_store.valid_session(cookie):
             if request.method not in {"GET", "HEAD"} and request.headers.get("origin") not in origins:
                 raise HTTPException(status_code=403, detail="admin_origin_not_allowed")
-            return "session"
+            return "administrator_session"
         configured = os.getenv("AI_CODE_REVIEWER_ADMIN_TOKEN")
         supplied = request.headers.get("authorization", "")
         if configured and len(configured) >= 32 and hmac.compare_digest(supplied, "Bearer " + configured):
-            return "legacy_bearer"
+            return "administrator_legacy_bearer"
         raise HTTPException(status_code=401, detail="provider_settings_unauthorized")
 
     def require_loopback_peer(request: Request) -> str:
         host = (request.client.host if request.client else "").casefold()
-        if any(request.headers.get(header) for header in ("forwarded", "x-forwarded-for", "x-real-ip")):
+        # With uvicorn's proxy-header middleware enabled, a trusted reverse
+        # proxy's sanitized X-Forwarded-For value is reflected in
+        # request.client.host. Allow it only when the effective peer is still
+        # loopback; an untrusted forwarded header cannot turn a remote peer into
+        # a loopback peer because uvicorn ignores headers from untrusted peers.
+        # This keeps first-run setup usable behind the loopback-bound deployment
+        # proxy while rejecting remote clients and spoofed headers in tests.
+        has_forwarded_peer = any(
+            request.headers.get(header)
+            for header in ("forwarded", "x-forwarded-for", "x-real-ip")
+        )
+        if has_forwarded_peer and host not in {"127.0.0.1", "::1", "localhost"}:
             raise HTTPException(status_code=403, detail="forwarded_peer_headers_not_allowed_for_local_setup")
         request_host = (request.url.hostname or "").casefold()
         if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
@@ -451,7 +525,7 @@ def create_app(service: Optional[ReviewFixService] = None,
         result = JSONResponse({"authenticated": True, "expires_in_seconds": ttl})
         result.set_cookie("acr_admin_session", token, max_age=ttl, httponly=True,
                           secure=request.url.scheme == "https", samesite="strict",
-                          path="/api/admin")
+                          path="/")
         return result
 
     @app.post("/api/admin/setup")
@@ -531,7 +605,7 @@ def create_app(service: Optional[ReviewFixService] = None,
             raise HTTPException(status_code=403, detail="admin_origin_not_allowed")
         auth_store.revoke_session(request.cookies.get("acr_admin_session"))
         result = JSONResponse({"authenticated": False})
-        result.delete_cookie("acr_admin_session", path="/api/admin", httponly=True,
+        result.delete_cookie("acr_admin_session", path="/", httponly=True,
                              secure=request.url.scheme == "https", samesite="strict")
         return result
 
@@ -619,6 +693,7 @@ def create_app(service: Optional[ReviewFixService] = None,
         require_admin(request)
         try:
             storage = credential_store.set(payload.credential_type, payload.value, persistent=payload.persistent)
+            _apply_github_credentials(lifecycle, credential_store, action_coordinator, include_action=True)
             auth_store.record_audit("github_credential_updated", {
                 "credential_type": payload.credential_type, "storage": storage,
             })
@@ -635,6 +710,7 @@ def create_app(service: Optional[ReviewFixService] = None,
         require_admin(request)
         try:
             result = credential_store.remove(credential_type)
+            _apply_github_credentials(lifecycle, credential_store, action_coordinator, include_action=True)
             auth_store.record_audit("github_credential_removed", {"credential_type": credential_type})
             if credential_type == "webhook_secret":
                 processor.stop()
@@ -690,7 +766,7 @@ def create_app(service: Optional[ReviewFixService] = None,
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         config = _policy_config_payload(_parse_repository_config(document["repositories"].get(identity.casefold(), {})))
         return {"repository": identity, "revision": revision, "policy": config,
-                "autonomous_commits": "unavailable_disabled_hard_gate"}
+                "autonomous_commits": "implemented_off_by_default_requires_independent_gates"}
 
     @app.put("/api/admin/github/repositories/{owner}/{repository}/policy")
     def update_repository_policy(owner: str, repository: str, payload: RepositoryPolicyRequest,
@@ -719,7 +795,7 @@ def create_app(service: Optional[ReviewFixService] = None,
                 "publish_review_comments": payload.publish_review_comments,
             })
             return {"repository": identity, "revision": revision, "policy": values,
-                    "autonomous_commits": "unavailable_disabled_hard_gate"}
+                    "autonomous_commits": "implemented_off_by_default_requires_independent_gates"}
         except ValueError as exc:
             code = str(exc)
             raise HTTPException(status_code=409 if code.endswith("conflict") else 422, detail=code) from exc
@@ -782,6 +858,75 @@ def create_app(service: Optional[ReviewFixService] = None,
         require_admin(request)
         return {"events": auth_store.audit_events(100)}
 
+    @app.get("/api/admin/webhook/deliveries")
+    def get_admin_webhook_deliveries(request: Request, limit: int = 25):
+        require_admin(request)
+        rows = processor.store.list_recent(limit=max(1, min(limit, 50)))
+        retryable_delivery_codes = {
+            "github_timeout", "github_network_error", "github_rate_limited",
+            "github_unavailable", "worker_interrupted_unknown_completion",
+        }
+        retryable_action_codes = {
+            "github_rate_limited", "reconciled_comment_absent_retry_requires_operator",
+        }
+        for row in rows:
+            actions = processor.store.get_actions(row["delivery_id"])
+            safe_actions = []
+            for item in actions:
+                status = item["publication_status"]
+                failure = item.get("failure_code")
+                retry_after = item.get("next_retry_at")
+                pending_operator_retry = (
+                    status == "pending" and bool(item.get("last_operator"))
+                    and isinstance(retry_after, (int, float))
+                )
+                retry_available = bool(
+                    item["action_type"] == "review_comment" and item["attempts"] < 3
+                    and (
+                        status == "failed" and failure in retryable_action_codes
+                        or pending_operator_retry and retry_after <= time.time()
+                    )
+                )
+                safe_actions.append({
+                    "action_id": item["action_id"], "action_type": item["action_type"],
+                    "publication_status": status, "attempts": item["attempts"],
+                    "failure_code": failure, "github_comment_id": item["github_comment_id"],
+                    "commit_sha": item.get("commit_sha"),
+                    "verification_status": item.get("verification_status"),
+                    "lifecycle_state": item.get("lifecycle_state"),
+                    "execution_evidence": (item.get("policy_decision") or {}).get("execution_evidence", {}),
+                    "retry_available": retry_available,
+                    "retry_after": retry_after if pending_operator_retry else None,
+                })
+            row["retry_available"] = bool(
+                row["status"] in {"failed", "dead_letter"}
+                and row["failure_code"] in retryable_delivery_codes
+                and row["attempts"] < 3 and not actions
+            )
+            row["actions"] = [{
+                **item,
+            } for item in safe_actions]
+        return {"deliveries": rows}
+
+    @app.post("/api/admin/webhook/deliveries/{delivery_id}/retry", status_code=202)
+    def retry_admin_webhook_delivery(delivery_id: str, request: Request):
+        actor_id = require_admin(request)
+        scheduled, next_attempt_at, reason = processor.store.schedule_delivery_retry(delivery_id)
+        if not scheduled:
+            status_code = 404 if reason == "delivery_not_found" else 409
+            raise HTTPException(status_code=status_code, detail=reason)
+        try:
+            auth_store.record_audit("webhook_delivery_retry_scheduled", {
+                "delivery_id": delivery_id, "actor_id": actor_id,
+                "next_attempt_at": next_attempt_at,
+            })
+        except Exception:
+            pass
+        processor.start()
+        processor._wake.set()
+        return {"delivery_id": delivery_id, "status": "pending",
+                "next_attempt_at": next_attempt_at, "reason": reason}
+
     @app.get("/api/health")
     def health():
         from llm.provider_settings import PROVIDER_SETTINGS
@@ -792,19 +937,32 @@ def create_app(service: Optional[ReviewFixService] = None,
             "provider": settings["review_provider"],
             "fix_provider": settings["fix_provider"],
             "provider_initialized": lifecycle.provider_initialized,
-            "state": "in_memory_process_local",
+            "state": "sqlite_durable" if lifecycle.state.persistence_store else "in_memory_process_local",
+            "webhook_storage": "sqlite_durable",
             "github_token_configured": bool(os.getenv("GITHUB_TOKEN")),
         }
 
     @app.get("/api/verification/capabilities")
     def verification_capabilities():
+        adapter = getattr(action_coordinator, "adapter", None)
+        executor = getattr(action_coordinator, "autonomous_executor", None)
+        staging_ready = bool(adapter and adapter.staging_enabled and adapter.staging_token)
+        commit_ready = bool(adapter and adapter.commit_enabled and adapter.commit_token)
+        behavioral_ready = bool(executor and executor.behavioral_verifier and executor.behavioral_tests)
+        workflow_ready = bool(executor and executor.workflow_identity)
+        calibration_ready = bool(os.getenv("AI_CODE_REVIEWER_RUNTIME_CALIBRATION_PATH")
+                                and os.getenv("AI_CODE_REVIEWER_CALIBRATION_DATASET_ID"))
         return {
             "syntax": "available_ast_parse_only",
             "static": "available_deterministic_ast_rules",
-            "behavioral": "not_run_isolated_execution_broker_unavailable",
+            "behavioral": "configured_remote_attested_broker" if behavioral_ready else "not_run_isolated_execution_broker_unavailable",
             "github_ci": "read_only_exact_sha_verification_available",
-            "candidate_revision_ci": "requires_candidate_revision",
-            "commit_execution": "disabled",
+            "candidate_revision_ci": "configured_workflow_and_checks_required" if workflow_ready else "requires_candidate_revision_and_workflow_identity",
+            "confidence_calibration": "artifact_configured_validation_occurs_per_finding" if calibration_ready else "unavailable_without_signed_independent_labels",
+            "candidate_staging": "enabled" if staging_ready else "disabled_or_credential_missing",
+            "autonomous_fix": "implemented_off_by_default_requires_independent_gates",
+            "commit_execution": "enabled_but_fail_closed_gates_required" if commit_ready else "disabled_by_default_or_credential_missing",
+            "commit_execution_reason": "explicit_owner_configuration_and_per_finding_independent_gates_required",
         }
 
     @app.post("/api/github/pr-reviews", status_code=200)
@@ -929,29 +1087,177 @@ def create_app(service: Optional[ReviewFixService] = None,
         action = next((item for item in record["actions"] if item["action_id"] == action_id), None)
         if action is None:
             raise HTTPException(status_code=404, detail="webhook_action_not_found")
-        if action.get("action_type") != "review_comment" or action.get("publication_status") not in {
+        if action.get("action_type") not in {"review_comment", "autonomous_fix"} or action.get("publication_status") not in {
                 "unknown", "requires_reconciliation"}:
             raise HTTPException(status_code=409, detail="action_does_not_require_reconciliation")
         owner, separator, repository = str(action.get("repository", "")).partition("/")
         if not separator:
             raise HTTPException(status_code=409, detail="action_repository_identity_invalid")
         from mcp_server.github_pr import PullRequestRef
-
-        result = action_coordinator.adapter.reconcile_inline_comment(
-            PullRequestRef(owner, repository, int(action["pr_number"])),
-            repository=action["repository"], expected_head_sha=action["head_sha"],
-            operation_id=action.get("operation_id") or action_id,
-        )
-        if result.get("status") == "published":
-            processor.store.mark_reconciled(action_id, status="published",
-                                            github_comment_id=result.get("github_comment_id"))
-        elif result.get("status") == "not_published":
-            processor.store.mark_reconciled(action_id, status="failed",
-                                            failure_code="reconciled_comment_absent_retry_requires_operator")
-        elif result.get("status") == "stale":
-            processor.store.mark_reconciled(action_id, status="stale",
-                                            failure_code="reconciled_expected_revision_changed")
+        if action.get("action_type") == "autonomous_fix":
+            policy = action.get("policy_decision") or {}
+            evidence = policy.get("execution_evidence") or {}
+            candidate = evidence.get("candidate") or {}
+            action_ref = PullRequestRef(owner, repository, int(action["pr_number"]))
+            if evidence.get("commit_attempted") is True:
+                result = action_coordinator.adapter.reconcile_commit(
+                    action_ref, repository=action["repository"], branch=str(evidence.get("branch", "")),
+                    expected_head_sha=action["head_sha"], candidate_sha=str(candidate.get("candidate_sha", "")),
+                )
+                if result.get("status") == "published":
+                    processor.store.mark_commit_reconciled(action_id, status="published",
+                                                           commit_sha=result.get("commit_sha"))
+                elif result.get("status") == "not_published":
+                    processor.store.mark_commit_reconciled(action_id, status="failed",
+                                                           failure_code="reconciled_commit_absent_operator_review")
+                elif result.get("status") == "stale":
+                    processor.store.mark_commit_reconciled(action_id, status="stale",
+                                                           failure_code="reconciled_commit_head_changed")
+            else:
+                result = action_coordinator.adapter.reconcile_candidate_revision(
+                    action_ref, repository=action["repository"], operation_id=action_id,
+                    expected_candidate_sha=candidate.get("candidate_sha"),
+                )
+                if result.get("status") == "candidate_staged":
+                    processor.store.finish_action(action_id, "blocked",
+                                                  failure_code="candidate_stage_confirmed_manual_review_required")
+                elif result.get("status") == "not_staged":
+                    processor.store.finish_action(action_id, "failed",
+                                                  failure_code="candidate_stage_absence_confirmed_operator_review")
+        else:
+            result = action_coordinator.adapter.reconcile_inline_comment(
+                PullRequestRef(owner, repository, int(action["pr_number"])),
+                repository=action["repository"], expected_head_sha=action["head_sha"],
+                operation_id=action.get("operation_id") or action_id,
+                comment_kind=(action.get("policy_decision") or {}).get("comment_kind", "inline"),
+            )
+            if result.get("status") == "published":
+                processor.store.mark_reconciled(action_id, status="published",
+                                                github_comment_id=result.get("github_comment_id"))
+            elif result.get("status") == "not_published":
+                processor.store.mark_reconciled(action_id, status="failed",
+                                                failure_code="reconciled_comment_absent_retry_requires_operator")
+            elif result.get("status") == "stale":
+                processor.store.mark_reconciled(action_id, status="stale",
+                                                failure_code="reconciled_expected_revision_changed")
         return {"action_id": action_id, **result}
+
+    @app.post("/api/admin/webhook/deliveries/{delivery_id}/actions/{action_id}/retry", status_code=202)
+    def retry_failed_webhook_action(delivery_id: str, action_id: str, request: Request):
+        actor_id = require_admin(request)
+        delivery = processor.store.get(delivery_id)
+        if delivery is None:
+            raise HTTPException(status_code=404, detail="webhook_delivery_not_found")
+        action = next((item for item in delivery["actions"] if item["action_id"] == action_id), None)
+        if action is None:
+            raise HTTPException(status_code=404, detail="webhook_action_not_found")
+        if action.get("action_type") not in {"review_comment", "autonomous_fix"}:
+            raise HTTPException(status_code=409, detail="action_type_not_retryable")
+        if action.get("action_type") == "autonomous_fix":
+            # Unknown commit writes are reconciled only; no automatic or manual
+            # blind retry is offered by this endpoint.
+            raise HTTPException(status_code=409, detail="commit_reconciliation_required_no_blind_retry")
+        retryable_codes = {"github_rate_limited", "reconciled_comment_absent_retry_requires_operator"}
+        if action.get("publication_status") == "failed":
+            if action.get("failure_code") not in retryable_codes:
+                raise HTTPException(status_code=409, detail="action_failure_not_retryable")
+            owner, separator, repository_name = str(action.get("repository", "")).partition("/")
+            if not separator:
+                raise HTTPException(status_code=409, detail="action_repository_identity_invalid")
+            policy_record = action.get("policy_decision") or {}
+            comment_kind = policy_record.get("comment_kind", "inline")
+            from mcp_server.github_pr import PullRequestRef
+            reconciliation = action_coordinator.adapter.reconcile_inline_comment(
+                PullRequestRef(owner, repository_name, int(action["pr_number"])),
+                repository=action["repository"], expected_head_sha=action["head_sha"],
+                operation_id=action.get("operation_id") or action_id,
+                comment_kind=comment_kind,
+            )
+            if reconciliation.get("status") == "published":
+                processor.store.mark_reconciled(action_id, status="published",
+                                                github_comment_id=reconciliation.get("github_comment_id"))
+                return {"action_id": action_id, **reconciliation}
+            if reconciliation.get("status") != "not_published" or reconciliation.get("retry_safe") is not True:
+                raise HTTPException(status_code=409, detail="action_remote_state_not_safe_to_retry")
+            scheduled, next_attempt = processor.store.schedule_action_retry(
+                action_id, retryable=True, actor_id=actor_id,
+            )
+            if not scheduled:
+                raise HTTPException(status_code=409, detail="action_retry_limit_reached_or_state_changed")
+            try:
+                auth_store.record_audit("webhook_action_retry_scheduled", {
+                    "delivery_id": delivery_id, "action_id": action_id, "actor_id": actor_id,
+                })
+            except Exception:
+                pass
+            return {"action_id": action_id, "status": "pending",
+                    "next_attempt_at": next_attempt, "reason": "remote_absence_confirmed_retry_scheduled"}
+        if (action.get("publication_status") != "pending"
+                or not action.get("last_operator")
+                or not isinstance(action.get("next_retry_at"), (int, float))):
+            raise HTTPException(status_code=409, detail="action_retry_not_scheduled")
+        if action["next_retry_at"] > time.time():
+            raise HTTPException(status_code=409, detail="action_retry_backoff_active")
+        result_payload = delivery.get("result")
+        policy_evidence = (action.get("policy_decision") or {}).get("evidence", {})
+        file_path = policy_evidence.get("file_path") if isinstance(policy_evidence, dict) else None
+        finding = None
+        changed_paths = set()
+        if isinstance(result_payload, dict):
+            for file_result in result_payload.get("files", []):
+                if not isinstance(file_result, dict):
+                    continue
+                if (isinstance(file_result.get("path"), str)
+                        and file_result.get("status") in {"added", "modified", "renamed"}):
+                    changed_paths.add(file_result["path"])
+                if file_result.get("path") == file_path:
+                    finding = next((item for item in file_result.get("findings", [])
+                                    if isinstance(item, dict) and item.get("finding_id") == action.get("finding_id")), None)
+        if not isinstance(finding, dict):
+            processor.store.finish_action(action_id, "blocked", failure_code="retry_finding_payload_unavailable")
+            raise HTTPException(status_code=409, detail="retry_finding_payload_unavailable")
+        from mcp_server.github_policy import PolicyInput, evaluate_finding, load_repository_action_config
+        from mcp_server.github_pr import PullRequestRef
+        repository = str(action["repository"])
+        action_coordinator.configs = load_repository_action_config()
+        current_policy = evaluate_finding(action_coordinator.configs, PolicyInput(
+            repository=repository, finding=finding,
+            expected_head_sha=str(action["head_sha"]), current_head_sha=str(action["head_sha"]),
+            changed_lines=None, file_path=str(file_path or ""),
+            action_authorized=bool(getattr(action_coordinator.adapter, "token", None)),
+            branch=result_payload.get("head_branch") if isinstance(result_payload, dict) else None,
+            is_fork=(result_payload.get("head_repository") or repository).casefold() != repository.casefold()
+            if isinstance(result_payload, dict) else True,
+        ))
+        if current_policy.action != "review_comment" or not current_policy.eligible:
+            processor.store.finish_action(action_id, "denied", failure_code="current_policy_denied_retry")
+            raise HTTPException(status_code=409, detail="current_policy_denied_retry")
+        if not processor.store.claim_action(action_id):
+            raise HTTPException(status_code=409, detail="action_retry_claim_failed")
+        ref = PullRequestRef(owner=str(action["repository"]).split("/", 1)[0],
+                             repository=str(action["repository"]).split("/", 1)[1],
+                             number=int(action["pr_number"]))
+        if (action.get("policy_decision") or {}).get("comment_kind") == "inline":
+            publication = action_coordinator.adapter.publish_inline_comment(
+                ref, repository=repository, expected_head_sha=action["head_sha"],
+                finding=finding, changed_paths=changed_paths, operation_id=action_id,
+            )
+        else:
+            publication = action_coordinator.adapter.publish_general_comment(
+                ref, repository=repository, expected_head_sha=action["head_sha"],
+                finding=finding, operation_id=action_id,
+            )
+        processor.store.finish_action(action_id, publication.status,
+                                      github_comment_id=publication.github_id,
+                                      failure_code=publication.error_code)
+        try:
+            auth_store.record_audit("webhook_action_retry_completed", {
+                "delivery_id": delivery_id, "action_id": action_id,
+                "actor_id": actor_id, "status": publication.status,
+            })
+        except Exception:
+            pass
+        return {"action_id": action_id, **publication.to_dict()}
 
     @app.post("/api/reviews", status_code=201)
     def submit_review(request: ReviewRequest):
@@ -975,14 +1281,17 @@ def create_app(service: Optional[ReviewFixService] = None,
                 "provider_identity": lifecycle.provider_identity("review")}
 
     @app.get("/api/reviews/{review_id}")
-    def get_review(review_id: str):
+    def get_review(review_id: str, request: Request):
+        require_admin(request)
         handle = lifecycle.get_review(review_id)
         if handle is None:
             raise HTTPException(status_code=404, detail="review_not_found_or_expired")
         return {"review_id": review_id, "review": _review_payload(handle.response)}
 
     @app.post("/api/reviews/{review_id}/findings/{finding_id}/fixes", status_code=201)
-    def generate_fix(review_id: str, finding_id: str, request: FixRequest = FixRequest()):
+    def generate_fix(review_id: str, finding_id: str, http_request: Request,
+                     request: FixRequest = FixRequest()):
+        require_admin(http_request)
         try:
             candidate = lifecycle.generate_fix(review_id, finding_id, request.language)
         except LookupError:
@@ -1009,35 +1318,60 @@ def create_app(service: Optional[ReviewFixService] = None,
         return _candidate_payload(candidate)
 
     @app.get("/api/fixes/{candidate_id}")
-    def get_fix(candidate_id: str):
+    def get_fix(candidate_id: str, request: Request):
+        require_admin(request)
         candidate = lifecycle.get_candidate(candidate_id)
         if candidate is None:
             raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
         return _candidate_payload(candidate)
 
     @app.post("/api/fixes/{candidate_id}/verify")
-    def verify_fix(candidate_id: str):
+    def verify_fix(candidate_id: str, request: Request):
+        require_admin(request)
         try:
             return lifecycle.verify(candidate_id).to_dict()
         except LookupError:
             raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
 
     @app.post("/api/fixes/{candidate_id}/accept")
-    def accept_fix(candidate_id: str):
+    def accept_fix(candidate_id: str, request: Request):
         try:
-            return lifecycle.accept(candidate_id).to_dict()
+            actor_id = require_admin(request)
+            result = lifecycle.accept(candidate_id, actor_id=actor_id)
+            if result.outcome != "already_applied":
+                try:
+                    auth_store.record_audit("fix_candidate_decision", {
+                        "candidate_id": candidate_id, "finding_ref": result.candidate.finding_ref,
+                        "decision": "accepted", "outcome": result.outcome,
+                        "actor_id": actor_id,
+                    })
+                except Exception:
+                    pass
+            return result.to_dict()
         except LookupError:
             raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
 
     @app.post("/api/fixes/{candidate_id}/reject")
-    def reject_fix(candidate_id: str):
+    def reject_fix(candidate_id: str, request: Request):
         try:
-            return lifecycle.reject(candidate_id).to_dict()
+            actor_id = require_admin(request)
+            result = lifecycle.reject(candidate_id, actor_id=actor_id)
+            if result.outcome != "already_applied":
+                try:
+                    auth_store.record_audit("fix_candidate_decision", {
+                        "candidate_id": candidate_id, "finding_ref": result.candidate.finding_ref,
+                        "decision": "rejected", "outcome": result.outcome,
+                        "actor_id": actor_id,
+                    })
+                except Exception:
+                    pass
+            return result.to_dict()
         except LookupError:
             raise HTTPException(status_code=404, detail="candidate_not_found_or_expired")
 
     @app.get("/api/fixes/{candidate_id}/export")
-    def export_fix(candidate_id: str):
+    def export_fix(candidate_id: str, request: Request):
+        require_admin(request)
         try:
             return lifecycle.export(candidate_id).to_dict()
         except LookupError:
@@ -1078,7 +1412,10 @@ def _print_startup_summary(auth_store: AdminAuthStore, credentials: CredentialSt
     print("Recovery: python -m mcp_server.admin_cli reset-password")
     if bootstrap_credential:
         print(f"Admin Setup: {frontend_url}/setup")
-        print(f"One-time bootstrap credential (expires in 30 minutes): {bootstrap_credential}")
+        if os.getenv("AI_CODE_REVIEWER_PRINT_BOOTSTRAP_CREDENTIAL", "true").casefold() == "true":
+            print(f"One-time bootstrap credential (expires in 30 minutes): {bootstrap_credential}")
+        else:
+            print("Bootstrap credential withheld from logs; initialize with the local admin CLI.")
     elif not setup:
         print("Setup credential was previously issued or expired; run python -m mcp_server.admin_cli reset-bootstrap locally.")
     print(f"Groq: {'Configured' if provider_status['groq_api_key_configured'] else 'Not configured'}")
@@ -1112,6 +1449,8 @@ def _apply_github_credentials(lifecycle: ReviewFixService, credentials: Credenti
         adapter = getattr(action_coordinator, "adapter", None)
         if include_action and adapter is not None:
             adapter.token = credentials.get("github_actions_token")
+            adapter.staging_token = credentials.get("github_candidate_staging_token")
+            adapter.commit_token = credentials.get("github_autonomous_commit_token")
     except CredentialStoreError as exc:
         raise HTTPException(status_code=503, detail="github_credential_store_unavailable") from exc
 
@@ -1162,5 +1501,13 @@ def _run_webhook_review(lifecycle: ReviewFixService, event: dict,
     payload = result.to_dict()
     payload["provider_identity"] = lifecycle.provider_identity("review")
     if action_coordinator is not None:
-        payload["action_processing"] = action_coordinator.process_review(event, payload)
+        runtime_files = {
+            item.path: {"source_code": item._source_code,
+                        "review_response": item._validated_response}
+            for item in result.files
+            if item._source_code is not None and item._validated_response is not None
+        }
+        payload["action_processing"] = action_coordinator.process_review(
+            event, payload, runtime_files=runtime_files,
+        )
     return payload

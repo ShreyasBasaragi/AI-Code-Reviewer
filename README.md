@@ -10,6 +10,20 @@
 
 **Critique** is an AI code review system combining **Retrieval-Augmented Generation (RAG)**, deterministic Python static analysis, structured findings, safe fix verification, and human-controlled export. Review inference can use a hosted provider or an explicitly selected CUDA-only Qwen2.5-Coder-3B-Instruct + PEFT adapter. Local inference uses Transformers and PEFT without automatic downloads, quantization, CPU/MPS fallback, or model loading during backend startup.
 
+> **Release status (2026-11-19):** The repository contains a tested offline
+> review/fix workflow and GitHub webhook/action integrations, but the full
+> production and autonomous-review claims in older sections below have not
+> been validated against external systems. No live Groq inference, GitHub delivery/write, CUDA inference,
+> container startup, or behavioral execution was performed in the final sprint.
+> GitHub comments are policy-gated and disabled by default; autonomous commits
+> are implemented behind independent fail-closed gates and disabled by default.
+> No production commit has been attempted or validated. The recorded benchmark figures below are historical
+> project claims and are not current release verification results. See
+> [final release verification](docs/FINAL_SPRINT_RELEASE_REPORT.md),
+> [autonomous-fix implementation results](docs/AUTONOMOUS_COMMIT_IMPLEMENTATION_RESULTS.md),
+> [Task 7 runtime evidence](docs/FINAL_SPRINT_TASK7_RESULTS.md), and the
+> [Qwen teammate handoff](docs/QWEN_TEAMMATE_HANDOFF.md).
+
 ---
 
 ## Architecture Overview
@@ -145,6 +159,29 @@ C:\Major-Project\
 ---
 
 ## Installation & Setup
+
+### Current FastAPI and React application
+
+Start the backend in one terminal from the repository root:
+
+```sh
+./.venv/bin/python -m uvicorn mcp_server.http_api:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Start the frontend in another terminal:
+
+```sh
+cd frontend && VITE_API_BASE_URL=http://127.0.0.1:8000 npm run dev -- --host 127.0.0.1
+```
+
+The backend health route is `http://127.0.0.1:8000/api/health`. Startup is
+provider-lazy and does not load Qwen weights or call Groq. Reviews using Groq
+require an administrator-approved source-sharing consent and a server-side
+`GROQ_API_KEY`. See [local deployment configuration](deploy/README.md) for the
+single-worker Compose topology, read-only RAG mounts, state persistence, and
+HTTPS-edge requirements. The legacy standalone commands below describe the
+original project demonstration and are not the startup path for the current
+React/FastAPI application.
 
 For the current provider modes and safe CUDA provisioning procedure, see
 [Plan H CUDA deployment and validation](docs/PLAN_H_CUDA_DEPLOYMENT.md).

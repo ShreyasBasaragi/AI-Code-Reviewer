@@ -34,8 +34,20 @@ class Provider:
 
 
 def make_client(provider, retriever=None):
-    service = ReviewFixService(llm=provider, retriever=retriever, state=LifecycleState())
-    return TestClient(create_app(service)), service
+    # These API tests target the review lifecycle, not the canonical Chroma
+    # corpus. Isolate retrieval unless a test supplies an explicit fixture.
+    service = ReviewFixService(llm=provider, retriever=retriever or (lambda _code: []), state=LifecycleState())
+    class AuthenticatedAdmin:
+        def valid_session(self, token):
+            return token == "test-admin"
+
+        def record_audit(self, *_args, **_kwargs):
+            return None
+
+    client = TestClient(create_app(service, admin_auth=AuthenticatedAdmin()))
+    client.cookies.set("acr_admin_session", "test-admin", path="/")
+    client.headers.update({"Origin": "http://localhost:5173"})
+    return client, service
 
 
 def test_manual_review_runs_retrieval_validation_static_merge_and_returns_timings():

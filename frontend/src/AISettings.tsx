@@ -28,6 +28,7 @@ export function AISettings({ initialSection = 'ai' }: { initialSection?: 'ai' | 
     setSettings(current)
     setOptions(available)
     setAuthenticated(true)
+    window.dispatchEvent(new Event('admin-session-updated'))
   }
 
   useEffect(() => {
@@ -108,6 +109,7 @@ export function AISettings({ initialSection = 'ai' }: { initialSection?: 'ai' | 
     setBusy('logout')
     try { await api.logoutAdmin() } catch { /* A fresh login is required if server state expired. */ }
     setAuthenticated(false); setSettings(null); setOptions(null); setConnectivity(null); setGroqKey(''); setClearGroqKey(false); setAuthScreen('login'); setBusy('')
+    window.dispatchEvent(new Event('admin-session-expired'))
   }
 
   return <section className="panel ai-settings" aria-labelledby="ai-settings-heading">
@@ -143,8 +145,8 @@ export function AISettings({ initialSection = 'ai' }: { initialSection?: 'ai' | 
       </form> : settings && options ? section === 'github' ? <GitHubIntegrationSettings /> : <form className="settings-form" onSubmit={save}>
       <p>Secrets and settings are held in backend process memory. The Groq key is write-only here and is never returned to the browser.</p>
       <div className="settings-grid">
-        <label>Review provider<select value={settings.review_provider} onChange={(e) => setSettings({ ...settings, review_provider: e.target.value as ProviderSettings['review_provider'] })}><option value="groq">Groq</option><option value="qwen_local">Local Qwen</option></select></label>
-        <label>Fix provider<select value={settings.fix_provider} onChange={(e) => setSettings({ ...settings, fix_provider: e.target.value as ProviderSettings['fix_provider'] })}><option value="groq">Groq</option><option value="qwen_local">Local Qwen</option></select></label>
+        <label>Review provider<select value={settings.review_provider} onChange={(e) => setSettings({ ...settings, review_provider: e.target.value as ProviderSettings['review_provider'] })}>{[...new Set([...options.review_providers, settings.review_provider])].map((provider) => <option key={provider} value={provider}>{provider === 'groq' ? 'Groq' : 'Local Qwen'}</option>)}</select></label>
+        <label>Fix provider<select value={settings.fix_provider} onChange={(e) => setSettings({ ...settings, fix_provider: e.target.value as ProviderSettings['fix_provider'] })}>{[...new Set([...options.fix_providers, settings.fix_provider])].map((provider) => <option key={provider} value={provider}>{provider === 'groq' ? 'Groq' : 'Local Qwen'}</option>)}</select></label>
         <label>Approved Groq model<select value={settings.groq_model} onChange={(e) => setSettings({ ...settings, groq_model: e.target.value })}>{options.groq_models.map((model) => <option key={model} value={model}>{model}</option>)}</select><small>Server-approved strict structured-output models.</small></label>
         <label>Groq API key{settings.groq_api_key_configured && <small> A key is configured; leave blank to keep it.</small>}<input type="password" autoComplete="new-password" value={groqKey} onChange={(e) => { setGroqKey(e.target.value); setClearGroqKey(false) }} placeholder={settings.groq_api_key_configured ? 'Configured · hidden' : 'Enter key'} />{settings.groq_api_key_configured && <span className="consent-row"><input aria-label="Remove configured Groq key" type="checkbox" checked={clearGroqKey} onChange={(e) => { setClearGroqKey(e.target.checked); if (e.target.checked) setGroqKey('') }} /> Remove the configured key when saving</span>}</label>
         <label>Qwen base model<input value={settings.qwen_base_model} readOnly /></label>
@@ -155,6 +157,7 @@ export function AISettings({ initialSection = 'ai' }: { initialSection?: 'ai' | 
         <label>Fix temperature<input type="number" min="0" max="1" step="0.05" value={settings.fix_temperature} onChange={(e) => setSettings({ ...settings, fix_temperature: Number(e.target.value) })} /></label>
       </div>
       <label className="consent-row"><input type="checkbox" checked={settings.source_sharing_consent} onChange={(e) => setSettings({ ...settings, source_sharing_consent: e.target.checked })} /> I explicitly consent to sending submitted source to Groq when Groq is selected.</label>
+      <small>Review and fix providers are saved independently. A provider failure is reported; the backend does not silently switch providers.</small>
       <div className="settings-actions"><button className="primary-button" type="submit" disabled={!!busy}>{busy === 'save' ? 'Saving…' : 'Save settings'}</button><button className="secondary-button" type="button" onClick={() => void checkConnection()} disabled={!!busy}>{busy === 'connect' ? 'Checking…' : 'Check provider connection'}</button></div>
       <small>Connection checks run only when clicked. Groq check lists models; it does not run model inference. Qwen readiness inspects artifacts only and never loads weights.</small>
       {connectivity && <div className="connectivity-results" role="status">{(['groq', 'qwen'] as const).map((provider) => <div key={provider}><b>{provider === 'groq' ? 'Groq' : 'Qwen'} · {connectivity[provider].status.replace('_', ' ')}</b><span>{connectivity[provider].message}</span></div>)}</div>}

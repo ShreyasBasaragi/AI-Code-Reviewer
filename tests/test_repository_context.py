@@ -85,6 +85,20 @@ def test_repository_context_enforces_file_count_byte_and_truncation_limits():
     assert all(item.truncated for item in result.files)
 
 
+def test_optional_missing_repository_context_file_is_a_warning_not_a_review_failure():
+    class MissingReadmeClient(FakeContextClient):
+        def get_context_text_file(self, ref, path, revision, *, max_bytes):
+            raise RuntimeError("private GitHub response must not be exposed")
+
+    result = collect_repository_context(
+        MissingReadmeClient(), object(), "c" * 40,
+        RepositoryContextLimits(max_files=10, max_directory_depth=0, max_total_bytes=512),
+    )
+    assert result.status == "unavailable"
+    assert result.warnings == ("repository_context_file_unavailable",)
+    assert "private GitHub response" not in repr(result.diagnostics())
+
+
 def test_repository_evidence_ids_are_stable_revision_scoped_and_provenance_tagged():
     client = FakeContextClient()
     context = collect_repository_context(

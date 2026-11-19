@@ -4,6 +4,7 @@ from rag.adapters.github_api import convert_github_api_pr_to_canonical
 from rag.adapters.base import CanonicalRecord
 from rag.ingest_github import upsert_github_records_to_chromadb, get_chromadb_source_breakdown
 from rag.retrieve import retrieve_context
+import rag.ingest_github as github_ingest
 
 
 def test_parse_repo_string():
@@ -63,7 +64,10 @@ def test_convert_github_api_pr_to_canonical():
     assert rec.metadata["pr_number"] == 101
 
 
-def test_github_api_idempotency_and_chromadb_preservation():
+def test_github_api_idempotency_and_chromadb_preservation(tmp_path, monkeypatch):
+    # This test intentionally exercises upsert; keep the writable Chroma
+    # client inside pytest's disposable directory rather than the app corpus.
+    monkeypatch.setattr(github_ingest, "CHROMA_PERSIST_DIR", tmp_path / "github-ingest-db")
     # Create test canonical record
     test_rec = CanonicalRecord(
         id="github_api_unittest_repo_pr1_comment_123456",
@@ -89,7 +93,7 @@ def test_github_api_idempotency_and_chromadb_preservation():
         "New github_api records must be present in ChromaDB"
 
 
-def test_retrieve_context_works_with_github_api_records():
+def test_retrieve_context_works_with_github_api_records(isolated_v2_rag):
     snippets = retrieve_context("def login(user: Optional[User]):")
     assert isinstance(snippets, list)
     for item in snippets:

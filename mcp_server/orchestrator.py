@@ -345,8 +345,18 @@ def run_review_pipeline(
     try:
         logger.info("[Step 1/5] Retrieving RAG context from ChromaDB...")
         if retriever is None:
-            from rag.retrieve import retrieve_evidence
-            retriever = retrieve_evidence
+            from rag.retrieve import retrieve_evidence_with_diagnostics
+
+            def retriever(source: str):
+                evidence, diagnostics = retrieve_evidence_with_diagnostics(source)
+                if diagnostics.get("status") == "errored":
+                    from rag.retrieve_v3 import RAGConfigurationError
+
+                    error_type = diagnostics.get("error_type", "unknown")
+                    raise RAGConfigurationError(
+                        f"configured RAG corpus could not be queried ({error_type})"
+                    )
+                return evidence
         retrieved = retriever(code)
         for item in retrieved or []:
             if isinstance(item, RetrievedEvidence):
@@ -738,14 +748,14 @@ def verify_fix_candidate(
     return _verify_fix_candidate(candidate, expected_candidate_id=expected_candidate_id)
 
 
-def accept_fix(candidate: FixCandidate) -> FixApprovalResult:
+def accept_fix(candidate: FixCandidate, *, actor_id: str = "unattributed") -> FixApprovalResult:
     """Accept only a candidate with a matching successful syntax report."""
-    return _accept_fix_candidate(candidate)
+    return _accept_fix_candidate(candidate, actor_id=actor_id)
 
 
-def reject_fix(candidate: FixCandidate) -> FixApprovalResult:
+def reject_fix(candidate: FixCandidate, *, actor_id: str = "unattributed") -> FixApprovalResult:
     """Reject a candidate without changing its source or review."""
-    return _reject_fix_candidate(candidate)
+    return _reject_fix_candidate(candidate, actor_id=actor_id)
 
 
 def export_fix(candidate: FixCandidate) -> FixExportResult:

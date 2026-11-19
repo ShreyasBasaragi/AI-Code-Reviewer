@@ -115,7 +115,9 @@ def test_export_blocked_for_pending_or_rejected_candidate(state):
         orchestrator.export_fix(item)
 
 
-def test_unknown_or_expired_candidate_handle_fails_safely():
+def test_unknown_or_expired_candidate_handle_fails_safely(monkeypatch):
+    from mcp_server.state import PROCESS_STATE
+    monkeypatch.setattr(PROCESS_STATE, "persistence_store", None)
     result = json.loads(server.accept_fix("unknown-c3-handle"))
     assert result["outcome"] == "error"
     assert "unknown_or_expired" in result["error"]
@@ -155,7 +157,9 @@ def test_approval_and_export_do_not_call_model_or_retriever(monkeypatch):
     orchestrator.export_fix(accepted)
 
 
-def test_mcp_verify_accept_export_and_reject_are_explicit_cache_operations():
+def test_mcp_verify_accept_export_and_reject_are_explicit_cache_operations(monkeypatch):
+    from mcp_server.state import PROCESS_STATE
+    monkeypatch.setattr(PROCESS_STATE, "persistence_store", None)
     candidate = make_candidate()
     server._FIX_CANDIDATE_CACHE[candidate.candidate_id] = candidate
     verification = json.loads(server.verify_fix(candidate.candidate_id))

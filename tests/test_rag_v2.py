@@ -241,19 +241,14 @@ def test_retrieval_returns_up_to_four_documents():
     assert collection.query_args["n_results"] == 4
 
 
-def test_retrieval_has_no_side_effects():
-    """Verify retrieve_context does not mutate database or filesystem."""
-    persist_stat_before = None
-    if CHROMA_PERSIST_DIR.exists():
-        persist_stat_before = [f.stat().st_mtime for f in CHROMA_PERSIST_DIR.rglob("*") if f.is_file()]
+def test_retrieval_uses_isolated_corpus(isolated_v2_rag):
+    """Verify live corpus reads in tests are redirected to a disposable copy."""
+    import rag.retrieve as retrieve_module
 
-    # Execute multiple retrieval queries
+    assert retrieve_module.CHROMA_PERSIST_DIR == isolated_v2_rag
+    assert retrieve_module.CHROMA_PERSIST_DIR != CHROMA_PERSIST_DIR
     res1 = retrieve_context("def add(a, b): return a + b")
     res2 = retrieve_context("def mul(a, b): return a * b")
 
     assert isinstance(res1, list)
     assert isinstance(res2, list)
-
-    if CHROMA_PERSIST_DIR.exists() and persist_stat_before:
-        persist_stat_after = [f.stat().st_mtime for f in CHROMA_PERSIST_DIR.rglob("*") if f.is_file()]
-        assert len(persist_stat_before) == len(persist_stat_after)

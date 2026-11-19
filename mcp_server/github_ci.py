@@ -18,6 +18,7 @@ class CheckResult:
     conclusion: Optional[str]
     head_sha: Optional[str]
     source: str
+    workflow_identity: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -39,7 +40,8 @@ class CIReport:
 
 def evaluate_required_checks(*, candidate_sha: str, required: tuple[str, ...],
                              check_runs: Any, statuses: Any,
-                             response_sha: Optional[str]) -> CIReport:
+                             response_sha: Optional[str],
+                             expected_workflow_identity: Optional[str] = None) -> CIReport:
     """Map GitHub check runs/statuses; missing, stale, skipped all fail closed."""
     if not isinstance(candidate_sha, str) or not _SHA.fullmatch(candidate_sha) or response_sha != candidate_sha:
         return CIReport("unknown", candidate_sha, (), error_code="candidate_sha_mismatch")
@@ -54,7 +56,14 @@ def evaluate_required_checks(*, candidate_sha: str, required: tuple[str, ...],
         if not isinstance(name, str) or not isinstance(sha, str):
             continue
         state, conclusion = _check_run_state(item.get("status"), item.get("conclusion"))
-        normalized.setdefault(name, []).append(CheckResult(name, state, conclusion, sha, "check_run"))
+        workflow = item.get("workflow_identity")
+        if workflow is None:
+            workflow_id = item.get("workflow_id")
+            suite = item.get("check_suite") if isinstance(item.get("check_suite"), Mapping) else {}
+            workflow_id = workflow_id if workflow_id is not None else suite.get("workflow_id")
+            workflow = str(workflow_id) if workflow_id is not None else None
+        normalized.setdefault(name, []).append(CheckResult(name, state, conclusion, sha, "check_run",
+                                                            workflow if isinstance(workflow, str) else None))
     for item in statuses:
         if not isinstance(item, Mapping):
             continue
@@ -62,16 +71,18 @@ def evaluate_required_checks(*, candidate_sha: str, required: tuple[str, ...],
         if not isinstance(name, str) or not isinstance(sha, str):
             continue
         state = _status_state(item.get("state"))
-        normalized.setdefault(name, []).append(CheckResult(name, state, item.get("state"), sha, "commit_status"))
+        normalized.setdefault(name, []).append(CheckResult(name, state, item.get("state"), sha, "commit_status", None))
     checks: list[CheckResult] = []
     for required_name in names:
         candidates = normalized.get(required_name, [])
-        exact = [row for row in candidates if row.head_sha == candidate_sha]
+        exact = [row for row in candidates if row.head_sha == candidate_sha
+                 and (expected_workflow_identity is None or row.workflow_identity == expected_workflow_identity)]
         stale_only = bool(candidates) and not exact
         if not exact:
             checks.append(CheckResult(required_name, "unknown" if stale_only else "missing",
                                       None, candidates[-1].head_sha if candidates else None,
-                                      "stale" if stale_only else "none"))
+                                      "stale" if stale_only else "none",
+                                      candidates[-1].workflow_identity if candidates else None))
         else:
             # Multiple exact records must all be successful; never hide a failure.
             selected = exact[-1]
@@ -79,14 +90,15 @@ def evaluate_required_checks(*, candidate_sha: str, required: tuple[str, ...],
             if any(row.status in {"unknown", "missing"} for row in exact) and state == "success":
                 state = "unknown"
             checks.append(CheckResult(required_name, state, selected.conclusion,
-                                      candidate_sha, selected.source))
+                                      candidate_sha, selected.source, selected.workflow_identity))
     final = "passed" if all(row.status == "success" for row in checks) else (
         "failed" if any(row.status == "failure" for row in checks) else
         "pending" if any(row.status == "pending" for row in checks) else "unknown"
     )
     return CIReport(final, candidate_sha, tuple(checks),
                     tuple({"name": row.name, "status": row.status,
-                           "head_sha": row.head_sha, "source": row.source} for row in checks))
+                           "head_sha": row.head_sha, "source": row.source,
+                           "workflow_identity": row.workflow_identity} for row in checks))
 
 
 class GitHubCIClient:
@@ -96,7 +108,8 @@ class GitHubCIClient:
         self.fetch = fetch
 
     def verify(self, *, repository: str, candidate_sha: str,
-               required: tuple[str, ...]) -> CIReport:
+               required: tuple[str, ...],
+               expected_workflow_identity: Optional[str] = None) -> CIReport:
         if not isinstance(repository, str) or repository.count("/") != 1 or any(
                 not part for part in repository.split("/")):
             return CIReport("unknown", candidate_sha if isinstance(candidate_sha, str) else "",
@@ -114,6 +127,7 @@ class GitHubCIClient:
             candidate_sha=candidate_sha, required=required,
             check_runs=result.get("check_runs"), statuses=result.get("statuses"),
             response_sha=result.get("head_sha"),
+            expected_workflow_identity=expected_workflow_identity,
         )
 
 

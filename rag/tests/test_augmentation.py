@@ -50,7 +50,7 @@ def test_augment_context_determinism():
     assert out1 == out2, "Augmentation must be 100% deterministic"
 
 
-def test_end_to_end_rag_flow():
+def test_end_to_end_rag_flow(isolated_v2_rag):
     target_code = "def process_data(val, cache={}): cache[val] = True"
 
     # Step 1: Retrieve

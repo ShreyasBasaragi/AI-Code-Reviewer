@@ -22,7 +22,6 @@ from typing import Any, Mapping, Optional
 
 
 POLICY_VERSION = "github-action-policy-v1"
-AUTONOMOUS_COMMIT_EXECUTION_ENABLED = False  # J2 hard gate; J3 review required.
 _CATEGORIES = frozenset({"style", "naming", "formatting"})
 _PROTECTED_DEFAULTS = (".github/", "migrations/", "infra/", "security/", "auth/")
 _SENSITIVE_WORDS = frozenset({
@@ -332,7 +331,10 @@ def evaluate_finding(configs: Mapping[str, RepositoryActionConfig], item: Policy
         return PolicyDecision("no_external_action", False, "DENIED", tuple(dict.fromkeys(reasons)),
                               evidence=_decision_evidence(item, category, origin, config))
 
-    fix_reasons = list(reasons)
+    # Comment publication and candidate/commit credentials are independent
+    # capabilities. A disabled comment token must not invalidate an otherwise
+    # authorized fix decision; each write path checks its own credential gate.
+    fix_reasons = [reason for reason in reasons if reason != "review_comment_publication_not_authorized"]
     if not config.enable_autonomous_fixes:
         fix_reasons.append("repository_autonomous_fix_opt_in_disabled")
     if category not in _CATEGORIES or category not in config.allowed_low_risk_categories:
@@ -378,11 +380,32 @@ def evaluate_finding(configs: Mapping[str, RepositoryActionConfig], item: Policy
                           config.required_checks, evidence)
 
 
+def is_autonomous_low_risk_finding(finding: Mapping[str, Any], *, file_path: str,
+                                   config: RepositoryActionConfig) -> bool:
+    """Pre-generation deny check; it never authorizes a write by itself."""
+    if not isinstance(finding, Mapping) or not config.enable_autonomous_fixes:
+        return False
+    category = finding.get("issue_type")
+    if (category not in {"style", "naming", "formatting"}
+            or category not in config.allowed_low_risk_categories
+            or finding.get("uncertain") is True or finding.get("abstained") is True
+            or finding.get("severity") in {"critical", "high"}
+            or (isinstance(finding.get("rule_id"), str)
+                and finding["rule_id"].casefold().startswith("pysec"))
+            or _is_protected(file_path, config.protected_paths)):
+        return False
+    text = " ".join(str(finding.get(key, "")) for key in ("title", "explanation", "recommended_fix")).casefold()
+    if any(token.replace("_", " ") in text for token in _SENSITIVE_WORDS):
+        return False
+    return True
+
+
 def commit_execution_decision(*, repository: str, branch: Optional[str], expected_head_sha: str,
                               current_head_sha: Optional[str], is_fork: bool,
                               protected_branches: tuple[str, ...] = ("main", "master"),
-                              gates: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
-    """Evaluate commit prerequisites while retaining the permanent J3 hard gate.
+                              gates: Optional[Mapping[str, Any]] = None,
+                              execution_authorized: bool = False) -> dict[str, Any]:
+    """Evaluate independent commit prerequisites and an explicit runtime gate.
 
     `gates` is explicit evidence from independent verifiers. Missing, unknown,
     or mismatched fields deny eligibility; no LLM may call this function with
@@ -393,7 +416,7 @@ def commit_execution_decision(*, repository: str, branch: Optional[str], expecte
         reasons.append("invalid_repository_identity")
     if not branch:
         reasons.append("branch_identity_unavailable")
-    elif branch in protected_branches:
+    elif branch.casefold() in {value.casefold() for value in protected_branches}:
         reasons.append("protected_branch")
     if not _SHA.fullmatch(expected_head_sha or "") or current_head_sha != expected_head_sha:
         reasons.append("stale_or_unverified_head_sha")
@@ -419,11 +442,13 @@ def commit_execution_decision(*, repository: str, branch: Optional[str], expecte
         reasons.append("candidate_revision_ci_not_verified")
     if supplied.get("unexpected_files") not in ([], (), None):
         reasons.append("unexpected_files_modified")
-    # Keep the J2 reason for older consumers while adding the precise J3 gate.
-    reasons.extend(("autonomous_commit_execution_disabled_in_j2",
-                    "autonomous_commit_execution_hard_disabled_pending_live_staging"))
-    return {"status": "AUTONOMOUS_COMMIT_DISABLED", "eligible": False,
-            "execution_enabled": AUTONOMOUS_COMMIT_EXECUTION_ENABLED,
+    if execution_authorized is not True:
+        reasons.extend(("autonomous_commit_execution_disabled_by_default",
+                        "explicit_runtime_commit_authorization_required"))
+    eligible = not reasons
+    return {"status": "READY" if eligible else "AUTONOMOUS_COMMIT_DISABLED",
+            "eligible": eligible,
+            "execution_enabled": execution_authorized is True,
             "denial_reasons": list(dict.fromkeys(reasons)), "force_push": False,
             "candidate_revision_required": True}
 
