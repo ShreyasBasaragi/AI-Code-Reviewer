@@ -11,3 +11,5 @@ def check_if_number_is_even(number):
         return True
     else:
         return False
+
+# CodeMentor candidate verification test
