@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import resource
+import re
 import secrets
 import shutil
 import signal
@@ -14,12 +15,45 @@ import tempfile
 from pathlib import Path, PurePosixPath
 
 
+_SAFE_FAILURE = re.compile(
+    rb"^(tests|dataset_pipeline/tests|rag/tests)/(?:[A-Za-z0-9_.-]+/)*"
+    rb"[A-Za-z0-9_.-]+\.py::test_[A-Za-z0-9_]+:[0-9]{1,6}:"
+    rb"(?:setup|call|teardown|collect|unknown)$"
+)
+
+
 def _pytest_result_status(return_code: int, output: bytes, completion_token: str) -> str:
     """Require the trusted launcher to return after pytest, not just exit zero."""
     expected = f"CODEMENTOR_PYTEST_COMPLETE:{completion_token}:{return_code}".encode()
     if expected not in output.splitlines():
         return "errored"
     return "passed" if return_code == 0 else "failed"
+
+
+def _safe_pytest_diagnostics(output: bytes, completion_token: str) -> tuple[str | None, list[str]]:
+    """Extract token-bound counts and trusted test locations, never pytest text."""
+    if not re.fullmatch(r"[0-9a-f]{64}", completion_token):
+        return None, []
+    token = completion_token.encode("ascii")
+    summary_prefix = b"CODEMENTOR_PYTEST_SUMMARY:" + token + b":"
+    failure_prefix = b"CODEMENTOR_PYTEST_FAILURE:" + token + b":"
+    summary_pattern = re.compile(rb"^failed=([0-9]{1,6}):collected=([0-9]{1,6}):exit=([0-9]{1,2})$")
+    summary = None
+    failures: set[str] = set()
+    for line in output.splitlines():
+        if line.startswith(summary_prefix):
+            match = summary_pattern.fullmatch(line[len(summary_prefix):])
+            if match:
+                summary = (f"failed={match.group(1).decode()}:"
+                           f"collected={match.group(2).decode()}:exit={match.group(3).decode()}")
+        elif line.startswith(failure_prefix):
+            identifier = line[len(failure_prefix):]
+            if _SAFE_FAILURE.fullmatch(identifier):
+                identifier_text = identifier.decode("ascii")
+                failure_path = identifier_text.split("::", 1)[0]
+                if not any(part in {".", ".."} for part in PurePosixPath(failure_path).parts):
+                    failures.add(identifier_text)
+    return summary, sorted(failures)[:20]
 
 
 def main(request_path: str) -> int:
@@ -87,8 +121,14 @@ def main(request_path: str) -> int:
         if request.get("suppress_output") is not True:
             sys.stdout.buffer.write(output[-4000:])
         else:
-            print("CODEMENTOR_STATUS:" +
-                  _pytest_result_status(process.returncode, output, completion_token))
+            status = _pytest_result_status(process.returncode, output, completion_token)
+            print(f"CODEMENTOR_STATUS:{status}")
+            if status == "failed":
+                summary, failures = _safe_pytest_diagnostics(output, completion_token)
+                if summary:
+                    print(f"CODEMENTOR_PYTEST_DIAGNOSTICS:{summary}")
+                for failure in failures:
+                    print(f"CODEMENTOR_TEST_FAILURE:{failure}")
         return process.returncode
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
