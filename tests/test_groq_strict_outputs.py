@@ -82,6 +82,22 @@ def test_unknown_evidence_id_remains_invalid():
     assert "unknown_evidence_id" in parsed.processing_errors[0]
 
 
+@pytest.mark.parametrize("score", [True, "0.9", -0.01, 1.01, float("nan"), float("inf")])
+def test_model_confidence_rejects_malformed_or_out_of_range_values(score):
+    parsed = parse_review_response(_review(_finding(model_confidence_estimate=score)), [EVIDENCE])
+    assert not parsed.valid
+    assert "model_confidence_estimate_must_be_finite_number" in parsed.processing_errors[0]
+
+
+def test_model_confidence_accepts_nullable_finite_score():
+    parsed = parse_review_response(_review(_finding(model_confidence_estimate=0.83)), [EVIDENCE])
+    assert parsed.valid
+    assert parsed.findings[0].model_confidence_estimate == 0.83
+    missing = parse_review_response(_review(_finding(model_confidence_estimate=None)), [EVIDENCE])
+    assert missing.valid
+    assert missing.findings[0].model_confidence_estimate is None
+
+
 def test_missing_required_finding_field_remains_invalid():
     finding = _finding()
     finding.pop("title")
@@ -103,12 +119,15 @@ def test_strict_schema_covers_all_parser_finding_fields_and_requires_them():
     assert {"evidence_ids", "uncertain", "abstained"}.issubset(finding_schema["required"])
     assert schema["required"] == ["summary", "findings"]
     assert finding_schema["additionalProperties"] is False
+    score_schema = finding_schema["properties"]["model_confidence_estimate"]
+    assert {"type": "number", "minimum": 0, "maximum": 1} in score_schema["anyOf"]
+    assert {"type": "null"} in score_schema["anyOf"]
     assert schema["additionalProperties"] is False
     assert groq_review_response_format() == {
         "type": "json_schema",
         "json_schema": {"name": "code_review", "strict": True, "schema": schema},
     }
-    assert REVIEW_SCHEMA_VERSION == "review-v1"
+    assert REVIEW_SCHEMA_VERSION == "review-v2"
 
 
 def test_prompt_uncertainty_rule_and_example_are_consistent():
@@ -116,7 +135,10 @@ def test_prompt_uncertainty_rule_and_example_are_consistent():
 
     normalized = " ".join(REVIEW_OUTPUT_INSTRUCTIONS.split())
     assert "If no valid retrieved evidence supports a finding" in normalized
-    assert '"evidence_ids": [],\n      "uncertain": true' in REVIEW_OUTPUT_INSTRUCTIONS
+    assert ('"evidence_ids": [],\n      "model_confidence_estimate": null,\n'
+            '      "uncertain": true') in REVIEW_OUTPUT_INSTRUCTIONS
+    assert "subjective, uncalibrated estimate" in normalized
+    assert "not a calibrated probability" in normalized
 
 
 def test_groq_provider_sends_strict_response_format(monkeypatch):

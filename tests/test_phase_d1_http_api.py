@@ -271,7 +271,10 @@ def test_health_and_import_do_not_initialize_model(monkeypatch):
     assert response.json()["provider_initialized"] is False
 
 
-def test_verification_capabilities_report_fail_closed_automation_gates():
+def test_verification_capabilities_report_fail_closed_automation_gates(monkeypatch):
+    monkeypatch.delenv("GITHUB_MODEL_CONFIDENCE_POLICY", raising=False)
+    monkeypatch.delenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_REPOSITORY", raising=False)
+    monkeypatch.delenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_BRANCH", raising=False)
     client, _ = make_client()
     response = client.get("/api/verification/capabilities")
     assert response.status_code == 200
@@ -280,6 +283,7 @@ def test_verification_capabilities_report_fail_closed_automation_gates():
     assert payload["candidate_revision_ci"] == "requires_candidate_revision_and_workflow_identity"
     assert payload["behavioral"] == "not_run_isolated_execution_broker_unavailable"
     assert payload["confidence_calibration"] == "unavailable_without_signed_independent_labels"
+    assert payload["model_confidence_estimates"] == "strictly_validated_but_disabled_for_autonomous_actions"
     assert payload["commit_execution"] == "disabled_by_default_or_credential_missing"
 
 

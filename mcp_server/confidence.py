@@ -18,6 +18,110 @@ from typing import Any, Iterable, Mapping, Optional
 CALIBRATION_VERSION = "review-confidence-calibration-v1"
 MIN_CALIBRATION_EXAMPLES = 200
 MAX_EXPECTED_CALIBRATION_ERROR = 0.05
+MODEL_ESTIMATE_CONFIDENCE_POLICY = "academic_prototype"
+_MODEL_ESTIMATE_CATEGORIES = frozenset({"style", "naming", "formatting"})
+
+
+def valid_model_confidence_estimate(value: Any) -> Optional[float]:
+    """Validate a model's subjective score without treating it as calibration."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        score = float(value)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(score) or not 0 <= score <= 1:
+        return None
+    return score
+
+
+def model_estimate_prototype_enabled(*, repository: str, branch: str,
+                                     permitted_branches: Iterable[str]) -> bool:
+    """Require owner opt-in and an exact, allowlisted disposable test branch."""
+    configured_repository = os.getenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_REPOSITORY", "").strip()
+    configured_branch = os.getenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_BRANCH", "").strip()
+    return (
+        os.getenv("GITHUB_MODEL_CONFIDENCE_POLICY", "").strip().casefold()
+        == MODEL_ESTIMATE_CONFIDENCE_POLICY
+        and bool(configured_repository)
+        and configured_repository.casefold() == repository.casefold()
+        and bool(configured_branch)
+        and configured_branch.startswith("test/")
+        and branch == configured_branch
+        and branch in permitted_branches
+    )
+
+
+def model_estimate_confidence_evidence(
+    finding: Mapping[str, Any], *, model_id: Optional[str], repository: str,
+    branch: str, permitted_branches: Iterable[str],
+) -> Optional[dict[str, Any]]:
+    """Build explicitly uncalibrated evidence only for the opt-in test scope."""
+    category = finding.get("issue_type")
+    if (not isinstance(category, str) or category not in _MODEL_ESTIMATE_CATEGORIES
+            or not isinstance(model_id, str)
+            or not model_id.strip()
+            or not model_estimate_prototype_enabled(
+                repository=repository, branch=branch, permitted_branches=permitted_branches
+            )):
+        return None
+    score = valid_model_confidence_estimate(finding.get("model_confidence_estimate"))
+    if score is None or score < 0.80:
+        return None
+    return {
+        "confidence_source": "uncalibrated_model_estimate",
+        "calibrated": False,
+        "manifest_verified": False,
+        "model_id": model_id,
+        "finding_category": category,
+        "model_confidence_estimate": score,
+        "prototype_policy": MODEL_ESTIMATE_CONFIDENCE_POLICY,
+        "prototype_repository": repository,
+        "prototype_branch": branch,
+    }
+
+
+def verify_confidence_evidence(evidence: Any, *, repository: str, branch: str,
+                               permitted_branches: Iterable[str], threshold: Any) -> bool:
+    """Revalidate calibrated or explicitly scoped prototype evidence at write time."""
+    if not isinstance(evidence, Mapping):
+        return False
+    if evidence.get("confidence_source") in (None, "independent_calibration"):
+        score = evidence.get("calibrated_confidence")
+        return (
+            evidence.get("calibrated") is True
+            and evidence.get("manifest_verified") is True
+            and isinstance(evidence.get("model_id"), str)
+            and isinstance(evidence.get("dataset_id"), str)
+            and isinstance(evidence.get("finding_category"), str)
+            and evidence.get("finding_category") in _MODEL_ESTIMATE_CATEGORIES
+            and isinstance(evidence.get("artifact_sha256"), str)
+            and valid_model_confidence_estimate(score) is not None
+            and valid_model_confidence_estimate(threshold) is not None
+            and float(score) >= max(0.80, float(threshold))
+        )
+    if evidence.get("confidence_source") != "uncalibrated_model_estimate":
+        return False
+    score = valid_model_confidence_estimate(evidence.get("model_confidence_estimate"))
+    evidence_repository = evidence.get("prototype_repository")
+    evidence_branch = evidence.get("prototype_branch")
+    return (
+        evidence.get("calibrated") is False
+        and evidence.get("manifest_verified") is False
+        and evidence.get("prototype_policy") == MODEL_ESTIMATE_CONFIDENCE_POLICY
+        and isinstance(evidence_repository, str)
+        and evidence_repository.casefold() == repository.casefold()
+        and isinstance(evidence_branch, str) and evidence_branch == branch
+        and isinstance(evidence.get("finding_category"), str)
+        and evidence.get("finding_category") in _MODEL_ESTIMATE_CATEGORIES
+        and isinstance(evidence.get("model_id"), str) and bool(evidence.get("model_id").strip())
+        and score is not None
+        and valid_model_confidence_estimate(threshold) is not None
+        and score >= max(0.80, float(threshold))
+        and model_estimate_prototype_enabled(
+            repository=repository, branch=branch, permitted_branches=permitted_branches
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -280,8 +384,8 @@ def independently_supported_confidence(
 ) -> Optional[float]:
     """Return a value only when a validated calibration report matches the source.
 
-    The current provider schema does not emit confidence. Callers must not pass a
-    value copied from a model response and call it calibrated.
+    The provider schema may emit a subjective model estimate. Callers must not
+    pass that value here and call it independently calibrated.
     """
     if (report is None or not report.calibrated or report.status != "calibrated"
             or not model_id or not dataset_id or report.model_id != model_id
@@ -348,6 +452,7 @@ def load_runtime_confidence(path: Path | str, *, model_id: str, dataset_id: str,
     if not valid:
         return None
     return {
+        "confidence_source": "independent_calibration",
         "calibrated": True, "manifest_verified": True,
         "model_id": model_id, "dataset_id": dataset_id,
         "finding_category": finding_category,

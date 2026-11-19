@@ -7,7 +7,6 @@ the PR, repository contents, webhook body, or model response can change it.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import stat
@@ -19,6 +18,11 @@ import fcntl
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
+
+from mcp_server.confidence import (
+    model_estimate_prototype_enabled,
+    valid_model_confidence_estimate,
+)
 
 
 POLICY_VERSION = "github-action-policy-v1"
@@ -75,6 +79,7 @@ class PolicyInput:
     confidence: Optional[float] = None
     confidence_source: Optional[str] = None
     confidence_calibrated: bool = False
+    prototype_confidence_approved: bool = False
     syntax_status: str = "not_run"
     static_status: str = "not_run"
     behavioral_status: str = "not_run"
@@ -341,13 +346,29 @@ def evaluate_finding(configs: Mapping[str, RepositoryActionConfig], item: Policy
         fix_reasons.append("category_not_allowlisted_low_risk")
     if category in _SENSITIVE_WORDS:
         fix_reasons.append("high_risk_category")
-    if not item.confidence_calibrated:
-        fix_reasons.append("independently_calibrated_confidence_required")
-    if item.confidence is None:
+    independent_confidence = (
+        item.confidence_calibrated is True
+        and item.confidence_source in {"independent_calibration", "validated_static_measurement"}
+    )
+    prototype_confidence = (
+        item.confidence_calibrated is False
+        and item.confidence_source == "uncalibrated_model_estimate"
+        and item.prototype_confidence_approved is True
+        and item.branch is not None
+        and model_estimate_prototype_enabled(
+            repository=item.repository, branch=item.branch, permitted_branches=config.permitted_branches
+        )
+    )
+    if not independent_confidence and not prototype_confidence:
+        fix_reasons.append("confidence_policy_not_supported")
+    confidence_score = valid_model_confidence_estimate(item.confidence)
+    if confidence_score is None:
         fix_reasons.append("confidence_unavailable")
-    elif isinstance(item.confidence, bool) or not isinstance(item.confidence, (int, float)) or item.confidence < config.confidence_threshold:
+    elif confidence_score < max(0.80, config.confidence_threshold):
         fix_reasons.append("confidence_below_threshold")
-    if item.confidence_source not in {"independent_calibration", "validated_static_measurement"}:
+    if item.confidence_source not in {
+        "independent_calibration", "validated_static_measurement", "uncalibrated_model_estimate"
+    }:
         fix_reasons.append("untrusted_confidence_source")
     if item.changed_lines is None or item.changed_lines > config.max_changed_lines:
         fix_reasons.append("changed_line_limit_exceeded_or_unknown")
@@ -403,13 +424,14 @@ def is_autonomous_low_risk_finding(finding: Mapping[str, Any], *, file_path: str
 def commit_execution_decision(*, repository: str, branch: Optional[str], expected_head_sha: str,
                               current_head_sha: Optional[str], is_fork: bool,
                               protected_branches: tuple[str, ...] = ("main", "master"),
+                              permitted_branches: tuple[str, ...] = (),
                               gates: Optional[Mapping[str, Any]] = None,
                               execution_authorized: bool = False) -> dict[str, Any]:
     """Evaluate independent commit prerequisites and an explicit runtime gate.
 
-    `gates` is explicit evidence from independent verifiers. Missing, unknown,
-    or mismatched fields deny eligibility; no LLM may call this function with
-    its own confidence claim as evidence.
+    `gates` is explicit evidence from independent verifiers. A model estimate
+    is accepted only under the exact owner-approved disposable-branch prototype
+    scope. Missing, unknown, or mismatched fields deny eligibility.
     """
     reasons: list[str] = []
     if not _REPO.fullmatch(repository or ""):
@@ -424,7 +446,7 @@ def commit_execution_decision(*, repository: str, branch: Optional[str], expecte
         reasons.append("fork_write_not_explicitly_authorized")
     supplied = gates if isinstance(gates, Mapping) else {}
     required_true = (
-        "repository_opt_in", "eligible_low_risk_category", "calibration_supported",
+        "repository_opt_in", "eligible_low_risk_category",
         "source_hashes_valid", "syntax_passed", "static_passed",
         "behavioral_passed", "candidate_ci_passed", "scope_valid",
         "write_permission_valid", "durable_record_reserved", "idempotency_reserved",
@@ -432,10 +454,22 @@ def commit_execution_decision(*, repository: str, branch: Optional[str], expecte
     for key in required_true:
         if supplied.get(key) is not True:
             reasons.append(f"required_gate_{key}_not_passed")
+    confidence_source = supplied.get("confidence_source", "independent_calibration")
+    calibrated_confidence = supplied.get("calibration_supported") is True
+    prototype_confidence = (
+        supplied.get("prototype_confidence_policy_approved") is True
+        and confidence_source == "uncalibrated_model_estimate"
+        and branch is not None
+        and model_estimate_prototype_enabled(
+            repository=repository, branch=branch, permitted_branches=permitted_branches
+        )
+    )
+    if not calibrated_confidence and not prototype_confidence:
+        reasons.append("required_gate_confidence_policy_not_passed")
     confidence = supplied.get("confidence")
-    if (isinstance(confidence, bool) or not isinstance(confidence, (int, float))
-            or not math.isfinite(float(confidence)) or not 0.80 <= confidence <= 1.0):
-        reasons.append("independent_confidence_threshold_not_met")
+    confidence_score = valid_model_confidence_estimate(confidence)
+    if confidence_score is None or confidence_score < 0.80:
+        reasons.append("confidence_threshold_not_met")
     if supplied.get("changed_lines") is None or isinstance(supplied.get("changed_lines"), bool) or not isinstance(supplied.get("changed_lines"), int) or not 1 <= supplied.get("changed_lines", 0) <= 3:
         reasons.append("three_line_limit_not_verified")
     if supplied.get("candidate_sha") is None or supplied.get("ci_sha") != supplied.get("candidate_sha"):
@@ -483,6 +517,7 @@ def _decision_evidence(item: PolicyInput, category: Any, origin: Any,
         "changed_lines": item.changed_lines,
         "confidence_source": item.confidence_source,
         "confidence_calibrated": item.confidence_calibrated,
+        "prototype_confidence_approved": item.prototype_confidence_approved,
         "configured_threshold": config.confidence_threshold,
         "configured_line_limit": config.max_changed_lines,
         "repository_opt_in": config.enable_autonomous_fixes,

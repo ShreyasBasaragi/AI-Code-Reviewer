@@ -668,12 +668,14 @@ class GitHubMCPActionAdapter:
             return self._commit_result("AUTONOMOUS_COMMIT_DISABLED", repository, pr_number,
                                        "final_commit_write_not_enabled")
         gates = kwargs.get("gates")
-        required_gates = {"repository_opt_in", "eligible_low_risk_category", "calibration_supported",
+        required_gates = {"repository_opt_in", "eligible_low_risk_category",
                           "source_hashes_valid", "syntax_passed", "static_passed", "behavioral_passed",
                           "candidate_ci_passed", "scope_valid", "write_permission_valid",
                           "durable_record_reserved", "idempotency_reserved"}
         if (not isinstance(ref, PullRequestRef) or not isinstance(gates, Mapping)
-                or any(gates.get(key) is not True for key in required_gates)):
+                or any(gates.get(key) is not True for key in required_gates)
+                or not (gates.get("calibration_supported") is True
+                        or gates.get("prototype_confidence_policy_approved") is True)):
             return self._commit_result("blocked", repository, pr_number, "required_gate_not_passed")
         operation_id, file_path = kwargs.get("operation_id"), kwargs.get("file_path")
         corrected_code, is_fork = kwargs.get("corrected_code"), kwargs.get("is_fork", False)
@@ -685,13 +687,28 @@ class GitHubMCPActionAdapter:
         if (not _verified_behavioral_evidence(kwargs.get("behavioral_evidence"), corrected_code)
                 or not _verified_ci_evidence(kwargs.get("ci_evidence"), candidate_sha,
                                              kwargs.get("required_checks", ()))
-                or not _verified_confidence_evidence(kwargs.get("confidence_evidence"),
-                                                      kwargs.get("confidence_threshold", 0.80))):
+                or not _verified_confidence_evidence(
+                    kwargs.get("confidence_evidence"), kwargs.get("confidence_threshold", 0.80),
+                    repository=repository, branch=branch,
+                    permitted_branches=kwargs.get("permitted_branches", ()),
+                )):
             return self._commit_result("blocked", repository, ref.number, "verification_evidence_invalid")
         confidence_evidence = kwargs["confidence_evidence"]
         decision_gates = dict(gates)
+        confidence_source = confidence_evidence.get("confidence_source")
+        if confidence_source is None and confidence_evidence.get("calibrated") is True:
+            confidence_source = "independent_calibration"
+        confidence_value = (
+            confidence_evidence.get("calibrated_confidence")
+            if confidence_source == "independent_calibration"
+            else confidence_evidence.get("model_confidence_estimate")
+        )
         decision_gates.update({
-            "confidence": confidence_evidence["calibrated_confidence"],
+            "confidence": confidence_value,
+            "confidence_source": confidence_source,
+            "prototype_confidence_policy_approved": (
+                gates.get("prototype_confidence_policy_approved") is True
+            ),
             "changed_lines": kwargs.get("changed_lines"),
             "candidate_sha": candidate_sha,
             "ci_sha": kwargs["ci_evidence"]["candidate_sha"],
@@ -701,6 +718,7 @@ class GitHubMCPActionAdapter:
             repository=repository, branch=branch, expected_head_sha=expected,
             current_head_sha=expected, is_fork=False,
             protected_branches=tuple(kwargs.get("protected_branches", ("main", "master"))),
+            permitted_branches=tuple(kwargs.get("permitted_branches", ())),
             gates=decision_gates, execution_authorized=True,
         )
         if decision.get("eligible") is not True:
@@ -992,17 +1010,14 @@ def _verified_ci_evidence(evidence: Any, candidate_sha: str, required_checks: An
                for name in required) and isinstance(evidence.get("workflow_identity"), str)
 
 
-def _verified_confidence_evidence(evidence: Any, threshold: Any) -> bool:
-    if not isinstance(evidence, Mapping):
-        return False
-    confidence = evidence.get("calibrated_confidence")
-    return (evidence.get("calibrated") is True and evidence.get("manifest_verified") is True
-            and isinstance(evidence.get("model_id"), str) and isinstance(evidence.get("dataset_id"), str)
-            and isinstance(evidence.get("finding_category"), str)
-            and isinstance(evidence.get("artifact_sha256"), str)
-            and isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
-            and isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
-            and float(confidence) >= max(0.80, float(threshold)))
+def _verified_confidence_evidence(evidence: Any, threshold: Any, *, repository: str,
+                                  branch: str, permitted_branches: Any) -> bool:
+    from mcp_server.confidence import verify_confidence_evidence
+    return verify_confidence_evidence(
+        evidence, repository=repository, branch=branch,
+        permitted_branches=permitted_branches if isinstance(permitted_branches, (list, tuple)) else (),
+        threshold=threshold,
+    )
 
 
 def _candidate_ci_wait_seconds() -> float:

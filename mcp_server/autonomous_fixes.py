@@ -11,6 +11,10 @@ from typing import Any, Callable, Mapping, Optional
 
 from fix_generation import FixCandidate
 from mcp_server.behavioral_verification import BehavioralVerifier
+from mcp_server.confidence import (
+    model_estimate_confidence_evidence,
+    valid_model_confidence_estimate,
+)
 from mcp_server.github_policy import (PolicyDecision, PolicyInput, evaluate_finding,
                                       is_autonomous_low_risk_finding)
 from mcp_server.github_pr import PullRequestRef
@@ -86,14 +90,34 @@ class AutonomousFixExecutor:
                 or not isinstance(original_code, str)):
             return blocked("validated_review_source_unavailable")
         confidence = self.confidence_resolver(finding)
+        branch = review.get("head_branch")
+        if (not isinstance(confidence, Mapping) and finding.get("origin") == "llm"
+                and isinstance(branch, str)):
+            confidence = model_estimate_confidence_evidence(
+                finding, model_id=review.get("provider_identity"), repository=repo,
+                branch=branch, permitted_branches=config.permitted_branches,
+            )
         if not isinstance(confidence, Mapping):
-            return blocked("independent_calibration_unavailable")
+            return blocked("confidence_evidence_unavailable")
         if (confidence.get("finding_category") != finding.get("issue_type")
                 or confidence.get("model_id") != review.get("provider_identity")):
-            return blocked("calibration_model_or_category_mismatch")
+            return blocked("confidence_model_or_category_mismatch")
+        confidence_source = confidence.get("confidence_source")
+        if confidence_source is None and confidence.get("calibrated") is True:
+            confidence_source = "independent_calibration"
+        if confidence_source == "independent_calibration":
+            confidence_score = valid_model_confidence_estimate(confidence.get("calibrated_confidence"))
+            confidence_calibrated = confidence.get("calibrated") is True
+        elif confidence_source == "uncalibrated_model_estimate":
+            confidence_score = valid_model_confidence_estimate(confidence.get("model_confidence_estimate"))
+            confidence_calibrated = False
+        else:
+            return blocked("confidence_source_untrusted")
         threshold = max(0.80, float(config.confidence_threshold))
-        if confidence.get("calibrated_confidence", 0) < threshold:
-            return blocked("calibrated_confidence_below_threshold")
+        if confidence_score is None or confidence_score < threshold:
+            return blocked("confidence_below_threshold")
+        if confidence_source == "independent_calibration" and not confidence_calibrated:
+            return blocked("calibration_evidence_invalid")
         candidate = self.fix_generator(review_response, str(finding_id), original_code)
         if not isinstance(candidate, FixCandidate) or candidate.generation_status != "generated" or not candidate.corrected_code:
             return blocked("fix_generation_failed")
@@ -241,8 +265,9 @@ class AutonomousFixExecutor:
         policy = evaluate_finding({repo.casefold(): config}, PolicyInput(
             repository=repo, finding=finding, expected_head_sha=str(head_sha),
             current_head_sha=review.get("head_sha"), changed_lines=changed_lines,
-            file_path=path, confidence=float(confidence["calibrated_confidence"]),
-            confidence_source="independent_calibration", confidence_calibrated=True,
+            file_path=path, confidence=float(confidence_score),
+            confidence_source=confidence_source, confidence_calibrated=confidence_calibrated,
+            prototype_confidence_approved=(confidence_source == "uncalibrated_model_estimate"),
             syntax_status="passed", static_status="passed", behavioral_status="passed",
             ci_status="passed", action_authorized=True,
             branch=review.get("head_branch"), is_fork=False,
@@ -253,7 +278,11 @@ class AutonomousFixExecutor:
         gates = {
             "repository_opt_in": True,
             "eligible_low_risk_category": True,
-            "calibration_supported": True,
+            "calibration_supported": confidence_source == "independent_calibration",
+            "prototype_confidence_policy_approved": (
+                confidence_source == "uncalibrated_model_estimate"
+            ),
+            "confidence_source": confidence_source,
             "source_hashes_valid": proposal.get("original_sha256") == hashlib.sha256(original_code.encode()).hexdigest()
                                    and proposal.get("corrected_sha256") == hashlib.sha256(candidate.corrected_code.encode()).hexdigest(),
             "syntax_passed": proposal.get("syntax_status") == "passed",

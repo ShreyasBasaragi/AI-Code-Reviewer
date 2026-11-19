@@ -994,6 +994,12 @@ def create_app(service: Optional[ReviewFixService] = None,
         workflow_ready = bool(executor and executor.workflow_identity)
         calibration_ready = bool(os.getenv("AI_CODE_REVIEWER_RUNTIME_CALIBRATION_PATH")
                                 and os.getenv("AI_CODE_REVIEWER_CALIBRATION_DATASET_ID"))
+        prototype_confidence_configured = (
+            os.getenv("GITHUB_MODEL_CONFIDENCE_POLICY", "").strip().casefold()
+            == "academic_prototype"
+            and bool(os.getenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_REPOSITORY", "").strip())
+            and os.getenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_BRANCH", "").strip().startswith("test/")
+        )
         if has_github_hosted:
             hosted_policy = getattr(executor, "github_hosted_commit_policy", "")
             behavioral_commit_scope = (
@@ -1022,8 +1028,12 @@ def create_app(service: Optional[ReviewFixService] = None,
             "github_ci": "read_only_exact_sha_verification_available",
             "candidate_revision_ci": "configured_workflow_and_checks_required" if workflow_ready else "requires_candidate_revision_and_workflow_identity",
             "confidence_calibration": "artifact_configured_validation_occurs_per_finding" if calibration_ready else "unavailable_without_signed_independent_labels",
+            "model_confidence_estimates": (
+                "explicit_owner_opt_in_configured_for_disposable_test_branch"
+                if prototype_confidence_configured else "strictly_validated_but_disabled_for_autonomous_actions"
+            ),
             "candidate_staging": "enabled" if staging_ready else "disabled_or_credential_missing",
-            "autonomous_fix": "implemented_off_by_default_requires_independent_gates",
+            "autonomous_fix": "implemented_off_by_default_requires_supported_confidence_and_independent_gates",
             "commit_execution": "enabled_but_fail_closed_gates_required" if commit_ready else "disabled_by_default_or_credential_missing",
             "commit_execution_reason": "explicit_owner_configuration_and_per_finding_independent_gates_required",
         }

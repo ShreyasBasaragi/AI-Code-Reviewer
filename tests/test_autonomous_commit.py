@@ -40,6 +40,7 @@ class ReadClient:
         self.fork = fork
         self.stale_after_stage = stale_after_stage
         self.after_staging = False
+        self.branch = "feature/fix"
 
     def get_pull(self, ref):
         head_owner = "other" if self.fork else "acme"
@@ -50,7 +51,7 @@ class ReadClient:
             "number": ref.number, "state": "open",
             "base": {"sha": "9" * 40, "ref": "main",
                      "repo": {"owner": {"login": "acme"}, "name": "demo"}},
-            "head": {"sha": sha, "ref": "feature/fix",
+            "head": {"sha": sha, "ref": self.branch,
                      "repo": {"owner": {"login": head_owner}, "name": "demo"}},
         }
 
@@ -133,11 +134,11 @@ class APITransport:
             assert payload.get("inputs", {}).get("candidate_sha") == CANDIDATE
             assert headers.get("Authorization") == "Bearer stage-only"
             return {}
-        if "/git/ref/heads/feature/fix" in url and method == "GET":
+        if f"/git/ref/heads/{self.read.branch}" in url and method == "GET":
             if self.concurrent_ref:
                 self.read.branch_sha = self.concurrent_ref
             return {"object": {"sha": self.read.branch_sha}}
-        if "/git/refs/heads/feature/fix" in url and method == "PATCH":
+        if f"/git/refs/heads/{self.read.branch}" in url and method == "PATCH":
             assert payload == {"sha": CANDIDATE, "force": False}
             if self.read.branch_sha != HEAD:
                 raise AssertionError("non-fast-forward concurrent update must not be overwritten")
@@ -297,7 +298,7 @@ def test_webhook_review_runs_full_mocked_fix_stage_ci_and_nonforce_commit(tmp_pa
     coordinator, store, adapter, transport, event, runtime = make_coordinator(tmp_path)
     result = coordinator.process_review(event, review_payload(), runtime_files=runtime)
     action = result["actions"][0]
-    assert action["status"] == "published"
+    assert action["status"] == "published", action
     assert action["commit_sha"] == CANDIDATE
     assert action["candidate_branch"] == f"codementor-candidates/{action['action_id']}"
     assert action["behavioral"]["attestation_verified"] is True
@@ -327,6 +328,31 @@ def test_webhook_review_runs_full_mocked_fix_stage_ci_and_nonforce_commit(tmp_pa
     )
     assert replay.status == "published"
     assert replay.detail["idempotent_replay"] is True
+    assert sum(method == "PATCH" for method, *_ in transport.calls) == 1
+
+
+def test_prototype_model_estimate_runs_only_with_explicit_test_branch_scope(monkeypatch, tmp_path):
+    branch = "test/groq-confidence-prototype"
+    monkeypatch.setenv("GITHUB_MODEL_CONFIDENCE_POLICY", "academic_prototype")
+    monkeypatch.setenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_REPOSITORY", "acme/demo")
+    monkeypatch.setenv("GITHUB_MODEL_CONFIDENCE_PROTOTYPE_BRANCH", branch)
+    coordinator, store, _adapter, transport, event, runtime = make_coordinator(
+        tmp_path, confidence=None,
+    )
+    coordinator.autonomous_executor.confidence_resolver = lambda _finding: None
+    coordinator.configs["acme/demo"] = config(permitted_branches=(branch,))
+    coordinator.adapter.read_client.branch = branch
+    payload = review_payload(finding(model_confidence_estimate=0.91))
+    payload["head_branch"] = branch
+
+    result = coordinator.process_review(event, payload, runtime_files=runtime)
+
+    action = result["actions"][0]
+    assert action["status"] == "published", action
+    assert action["confidence"]["confidence_source"] == "uncalibrated_model_estimate"
+    assert action["confidence"]["calibrated"] is False
+    assert action["commit_sha"] == CANDIDATE
+    assert store.get_actions("delivery-1")[0]["commit_sha"] == CANDIDATE
     assert sum(method == "PATCH" for method, *_ in transport.calls) == 1
 
 
