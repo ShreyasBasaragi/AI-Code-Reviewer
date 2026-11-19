@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import base64
 
 from fix_generation import FixCandidate
 from mcp_server.autonomous_fixes import AutonomousFixExecutor
@@ -122,6 +123,7 @@ class APITransport:
             return {"object": {"sha": CANDIDATE}}
         if "/actions/workflows/7/dispatches" in url and method == "POST":
             assert payload.get("ref", "").startswith("codementor-candidates/")
+            assert payload.get("inputs", {}).get("candidate_sha") == CANDIDATE
             assert headers.get("Authorization") == "Bearer stage-only"
             return {}
         if "/git/ref/heads/feature/fix" in url and method == "GET":
@@ -302,6 +304,44 @@ def test_webhook_review_runs_full_mocked_fix_stage_ci_and_nonforce_commit(tmp_pa
     assert replay.status == "published"
     assert replay.detail["idempotent_replay"] is True
     assert sum(method == "PATCH" for method, *_ in transport.calls) == 1
+
+
+def test_tuple_evidence_ids_remain_valid_through_autonomous_fix_pipeline(tmp_path):
+    coordinator, _store, _adapter, transport, event, runtime = make_coordinator(tmp_path)
+    item = finding(evidence_ids=("rag-1",))
+    result = coordinator.process_review(event, review_payload(item), runtime_files=runtime)
+    assert result["actions"][0]["status"] == "published"
+    assert result["actions"][0]["behavioral"]["attestation_verified"] is True
+    assert any(method == "PATCH" for method, *_ in transport.calls)
+
+
+def test_candidate_staging_and_ci_work_without_final_commit_authorization(tmp_path):
+    coordinator, store, adapter, transport, event, runtime = make_coordinator(
+        tmp_path, commits=False,
+    )
+    adapter.commit_token = None
+    result = coordinator.process_review(event, review_payload(), runtime_files=runtime)
+    action = result["actions"][0]
+    assert action["status"] == "AUTONOMOUS_COMMIT_DISABLED"
+    assert action["candidate_sha"] == CANDIDATE
+    assert action["ci"]["status"] == "passed"
+    assert action["manual_review_fallback"] is True
+    assert any("/actions/workflows/7/dispatches" in url and method == "POST"
+               for method, url, *_ in transport.calls)
+    assert not any(method == "PATCH" for method, *_ in transport.calls)
+    stored = store.get_actions("delivery-1")[0]
+    assert stored["publication_status"] == "AUTONOMOUS_COMMIT_DISABLED"
+    assert stored["verification_status"] == "passed"
+
+
+def test_invalid_or_untyped_evidence_ids_block_candidate_staging(tmp_path):
+    for index, cited in enumerate((("missing",), (None,), (), "rag-1")):
+        coordinator, _store, _adapter, transport, event, runtime = make_coordinator(tmp_path / str(index))
+        result = coordinator.process_review(
+            event, review_payload(finding(evidence_ids=cited)), runtime_files=runtime,
+        )
+        assert result["actions"][0]["status"] == "blocked"
+        assert not any(method in {"POST", "PATCH"} for method, *_ in transport.calls)
 
 
 def test_security_and_uncalibrated_findings_fall_back_without_github_writes(tmp_path):
@@ -521,6 +561,7 @@ def test_remote_behavioral_broker_binds_candidate_tests_and_signed_fresh_attesta
     class Opener:
         def open(self, request, timeout):
             received["request"] = json.loads(request.data)
+            received["url"] = request.full_url
             unsigned = {
                 "request_id": received["request"]["request_id"],
                 "status": "passed", "executed": True, "exit_code": 0,
@@ -529,7 +570,9 @@ def test_remote_behavioral_broker_binds_candidate_tests_and_signed_fresh_attesta
                 "filesystem_restricted": True, "process_cleanup": True,
                 "timeout_enforced": True, "timeout_seconds": 30,
                 "memory_limit_bytes": 512 * 1024 * 1024, "cpu_limit_seconds": 20,
-                "test_identity": "offline-contract-tests-v1", "verifier_id": "sandbox-prod-v3",
+                "test_identity": hashlib.sha256(
+                    base64.b64decode(received["request"]["tests_base64"])
+                ).hexdigest(), "verifier_id": "sandbox-prod-v3",
                 "timestamp": time.time(), "duration_seconds": 0.2,
             }
             unsigned["signature"] = hmac.new(
@@ -540,7 +583,7 @@ def test_remote_behavioral_broker_binds_candidate_tests_and_signed_fresh_attesta
             return Response()
 
     monkeypatch.setattr("urllib.request.build_opener", lambda *_handlers: Opener())
-    broker = RemoteHTTPSExecutionBroker("https://executor.example/verify", key=key)
+    broker = RemoteHTTPSExecutionBroker("https://executor.example:8443/v1/execute", key=key)
     result = BehavioralVerifier(broker).verify(
         original_source=original, candidate_source=candidate,
         expected_source_sha256=hashlib.sha256(original).hexdigest(),
@@ -548,7 +591,9 @@ def test_remote_behavioral_broker_binds_candidate_tests_and_signed_fresh_attesta
     )
     assert result.status == "passed" and result.attestation_verified
     request = received["request"]
+    assert received["url"] == "https://executor.example:8443/v1/execute"
     assert request["candidate_sha256"] == sha
+    assert isinstance(request["issued_at"], (int, float))
     assert request["network"] is False and request["credentials"] == {}
     assert request["changed_files"] == ["src/app.py"]
     received["report"]["candidate_sha256"] = "b" * 64

@@ -50,9 +50,8 @@ class AutonomousFixExecutor:
         if not self.store.claim_action(action_id):
             return {"status": "duplicate_suppressed", "action_id": action_id}
         if (not config or not config.enable_autonomous_fixes
-                or not self.adapter.staging_enabled or not self.adapter.commit_enabled
-                or not self.adapter.staging_token or not self.adapter.commit_token):
-            return blocked("owner_opt_in_or_separate_write_authorization_missing")
+                or not self.adapter.staging_enabled or not self.adapter.staging_token):
+            return blocked("owner_opt_in_or_candidate_staging_authorization_missing")
         if (review.get("stale") is True or review.get("head_sha") != head_sha
                 or (review.get("head_repository") or repo).casefold() != repo.casefold()
                 or not isinstance(path, str) or not path.endswith(".py")
@@ -69,8 +68,12 @@ class AutonomousFixExecutor:
             evidence_ids = {item.get("evidence_id") for item in file_result.get("evidence", [])
                             if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)}
             cited = finding.get("evidence_ids")
-            if (not isinstance(cited, list) or not cited
-                    or any(item not in evidence_ids for item in cited)):
+            # The review schema preserves evidence references as tuples while
+            # webhook/API serialization may produce lists. Accept both without
+            # relaxing membership or type validation.
+            if (not isinstance(cited, (list, tuple)) or not cited
+                    or any(not isinstance(item, str) or not item or item not in evidence_ids
+                           for item in cited)):
                 return blocked("finding_evidence_validation_failed")
         if (not isinstance(review_response, object) or not getattr(review_response, "valid", False)
                 or not isinstance(original_code, str)):
@@ -212,6 +215,32 @@ class AutonomousFixExecutor:
             "durable_record_reserved": True,
             "idempotency_reserved": True,
         }
+        # Candidate staging and exact-SHA CI can be exercised independently.
+        # A separate final-write switch and token remain mandatory for commits.
+        if not self.adapter.commit_enabled or not self.adapter.commit_token:
+            self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
+                                             verification_status="passed", details={
+                                                 "candidate": created,
+                                                 "behavioral": behavioral_evidence,
+                                                 "ci": ci, "ci_dispatch": dispatch,
+                                                 "confidence": dict(confidence),
+                                                 "changed_lines": changed_lines,
+                                                 "branch": review.get("head_branch"),
+                                                 "commit_attempted": False,
+                                                 "final_commit_disabled": True,
+                                             })
+            self.store.finish_action(action_id, "AUTONOMOUS_COMMIT_DISABLED",
+                                     failure_code="final_commit_write_not_enabled",
+                                     verification_status="passed")
+            return {"status": "AUTONOMOUS_COMMIT_DISABLED",
+                    "reason": "final_commit_write_not_enabled",
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_sha": created["candidate_sha"],
+                    "candidate_branch": created["candidate_branch"],
+                    "ci_dispatch": dispatch, "ci": ci,
+                    "behavioral": behavioral_evidence,
+                    "confidence": dict(confidence),
+                    "commit_sha": None, "manual_review_fallback": True}
         self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
                                          verification_status="passed", details={
                                              "candidate": created, "behavioral": behavioral_evidence,

@@ -1,0 +1,26 @@
+[Unit]
+Description=CodeMentor isolated behavioral verification broker
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=codementor-executor
+SupplementaryGroups=docker
+EnvironmentFile=/etc/codementor-executor/executor.env
+WorkingDirectory=/opt/ai-code-reviewer
+ExecStart=/usr/bin/python3 /opt/ai-code-reviewer/deploy/behavioral_executor/service.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/codementor-executor/requests
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

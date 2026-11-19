@@ -371,7 +371,8 @@ class GitHubMCPActionAdapter:
             self._api_call(
                 "POST", self._repo_path(ref) + "/actions/workflows/"
                 + urllib.parse.quote(workflow_identity, safe="") + "/dispatches",
-                {"ref": candidate_branch}, token=self.staging_token,
+                {"ref": candidate_branch, "inputs": {"candidate_sha": candidate_sha}},
+                token=self.staging_token,
             )
             return {"status": "dispatched", "candidate_sha": candidate_sha,
                     "candidate_branch": candidate_branch, "workflow_identity": workflow_identity}

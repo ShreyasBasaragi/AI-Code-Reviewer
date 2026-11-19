@@ -73,20 +73,25 @@ class RemoteHTTPSExecutionBroker:
         self.endpoint = endpoint if endpoint is not None else os.getenv("AI_CODE_REVIEWER_SANDBOX_URL")
         self.key = (key if key is not None else os.getenv("AI_CODE_REVIEWER_SANDBOX_HMAC_KEY", "")).encode()
         self.timeout_seconds = min(max(int(timeout_seconds), 1), 120)
-        self._pending: set[str] = set()
+        self._pending: dict[str, dict[str, Any]] = {}
 
     def execute(self, *, source: bytes, tests: bytes, timeout_seconds: int,
                 memory_bytes: int, cpu_seconds: int, network: bool,
                 credentials: Mapping[str, str], changed_files: tuple[str, ...]) -> Mapping[str, Any]:
         parsed = urllib.parse.urlsplit(self.endpoint or "")
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("sandbox_endpoint_or_authentication_invalid") from exc
         if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
-                or parsed.query or parsed.fragment or parsed.port not in (None, 443)
+                or parsed.query or parsed.fragment or (port is not None and not 1 <= port <= 65535)
                 or len(self.key) < 32 or network is not False or credentials):
             raise ValueError("sandbox_endpoint_or_authentication_invalid")
         request_id = uuid.uuid4().hex
         candidate_sha = hashlib.sha256(source).hexdigest()
         unsigned = {
             "request_id": request_id,
+            "issued_at": time.time(),
             "candidate_sha256": candidate_sha,
             "source_base64": base64.b64encode(source).decode("ascii"),
             "tests_base64": base64.b64encode(tests).decode("ascii"),
@@ -121,8 +126,17 @@ class RemoteHTTPSExecutionBroker:
             raise ValueError("sandbox_attestation_invalid")
         if report.get("request_id") != request_id:
             raise ValueError("sandbox_request_identity_mismatch")
+        if report.get("status") not in {"passed", "failed", "errored", "timeout"}:
+            raise ValueError("sandbox_report_invalid")
         report["requested_candidate_sha256"] = candidate_sha
-        self._pending.add(request_id)
+        self._pending[request_id] = {
+            "candidate_sha256": candidate_sha,
+            "test_identity": hashlib.sha256(tests).hexdigest(),
+            "changed_files": list(changed_files),
+            "timeout_seconds": timeout_seconds,
+            "memory_limit_bytes": memory_bytes,
+            "cpu_limit_seconds": cpu_seconds,
+        }
         return report
 
     def verify_attestation(self, report: Mapping[str, Any], *, candidate_sha256: str,
@@ -133,9 +147,13 @@ class RemoteHTTPSExecutionBroker:
         request_id = report.get("request_id")
         signature = report.get("signature")
         timestamp = report.get("timestamp")
+        pending = self._pending.get(request_id) if isinstance(request_id, str) else None
         if (not isinstance(request_id, str) or request_id not in self._pending
+                or not isinstance(pending, Mapping)
                 or not isinstance(signature, str) or not isinstance(timestamp, (int, float))
                 or abs(time.time() - float(timestamp)) > 120):
+            if isinstance(request_id, str):
+                self._pending.pop(request_id, None)
             return False
         unsigned = {key: value for key, value in report.items()
                     if key not in {"signature", "requested_candidate_sha256"}}
@@ -145,13 +163,19 @@ class RemoteHTTPSExecutionBroker:
                  and report.get("candidate_sha256") == candidate_sha256
                  and report.get("requested_candidate_sha256") == candidate_sha256
                  and report.get("changed_files") == list(changed_files)
+                 and report.get("test_identity") == pending.get("test_identity")
+                 and pending.get("candidate_sha256") == candidate_sha256
+                 and pending.get("changed_files") == list(changed_files)
+                 and pending.get("timeout_seconds") == timeout_seconds
+                 and pending.get("memory_limit_bytes") == memory_bytes
+                 and pending.get("cpu_limit_seconds") == cpu_seconds
                  and report.get("timeout_enforced") is True
                  and report.get("timeout_seconds") == timeout_seconds
                  and report.get("memory_limit_bytes") == memory_bytes
                  and report.get("cpu_limit_seconds") == cpu_seconds
                  and isinstance(report.get("test_identity"), str) and bool(report["test_identity"])
                  and isinstance(report.get("verifier_id"), str) and bool(report["verifier_id"]))
-        self._pending.discard(request_id)
+        self._pending.pop(request_id, None)
         return valid
 
 
@@ -205,6 +229,15 @@ class BehavioralVerifier:
             return BehavioralVerificationResult("errored", "broker", original_hash,
                                                 candidate_hash, changed_files,
                                                 error_code="sandbox_report_invalid")
+        verifier = getattr(self.broker, "verify_attestation", None)
+        try:
+            attestation_valid = callable(verifier) and verifier(
+                report, candidate_sha256=candidate_hash, changed_files=changed_files,
+                timeout_seconds=self.timeout_seconds, memory_bytes=self.memory_bytes,
+                cpu_seconds=self.cpu_seconds,
+            ) is True
+        except Exception:
+            attestation_valid = False
         if (report.get("candidate_sha256") != candidate_hash
                 or report.get("changed_files") != list(changed_files)
                 or report.get("network_isolated") is not True
@@ -214,12 +247,7 @@ class BehavioralVerifier:
                 or report.get("timeout_enforced") is not True
                 or report.get("memory_limit_bytes") != self.memory_bytes
                 or report.get("cpu_limit_seconds") != self.cpu_seconds
-                or not callable(getattr(self.broker, "verify_attestation", None))
-                or self.broker.verify_attestation(
-                    report, candidate_sha256=candidate_hash, changed_files=changed_files,
-                    timeout_seconds=self.timeout_seconds, memory_bytes=self.memory_bytes,
-                    cpu_seconds=self.cpu_seconds,
-                ) is not True
+                or not attestation_valid
                 or (status == "passed" and (report.get("executed") is not True
                                               or report.get("exit_code") != 0))):
             return BehavioralVerificationResult("errored", "unattested_broker", original_hash,
