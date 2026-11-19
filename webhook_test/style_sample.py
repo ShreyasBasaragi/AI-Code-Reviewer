@@ -2,7 +2,7 @@ def calculate_total(item_prices):
     """Return the total price of the supplied items."""
     result = 0
     for individual_item_price in item_prices:
-        result = result + individual_item_price
+        result=result+individual_item_price
     return result
 
 
