@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 from rag.github.client import parse_repo_string, GitHubClient
 from rag.adapters.github_api import convert_github_api_pr_to_canonical
@@ -68,6 +70,43 @@ def test_github_api_idempotency_and_chromadb_preservation(tmp_path, monkeypatch)
     # This test intentionally exercises upsert; keep the writable Chroma
     # client inside pytest's disposable directory rather than the app corpus.
     monkeypatch.setattr(github_ingest, "CHROMA_PERSIST_DIR", tmp_path / "github-ingest-db")
+
+    # Chroma's SentenceTransformer embedding function downloads/loads the
+    # all-MiniLM model. The test checks persistence and idempotent upsert, so
+    # use stable local vectors and keep the real Chroma database operations.
+    class DeterministicEmbeddingFunction:
+        def __init__(self, model_name=None):
+            self.model_name = model_name
+
+        def __call__(self, input):
+            return [
+                [value / 255.0 for value in hashlib.sha256(text.encode("utf-8")).digest()[:8]]
+                for text in input
+            ]
+
+        @staticmethod
+        def name():
+            return "github-api-test-deterministic"
+
+        @staticmethod
+        def build_from_config(_config):
+            return DeterministicEmbeddingFunction()
+
+        def get_config(self):
+            return {}
+
+        def is_legacy(self):
+            return False
+
+        def supported_spaces(self):
+            return ["cosine", "l2", "ip"]
+
+    monkeypatch.setattr(
+        github_ingest.embedding_functions,
+        "SentenceTransformerEmbeddingFunction",
+        DeterministicEmbeddingFunction,
+    )
+
     # Create test canonical record
     test_rec = CanonicalRecord(
         id="github_api_unittest_repo_pr1_comment_123456",
