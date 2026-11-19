@@ -5,6 +5,7 @@ import hashlib
 import json
 import base64
 import time
+from dataclasses import asdict
 
 from fix_generation import FixCandidate
 from mcp_server.autonomous_fixes import AutonomousFixExecutor
@@ -31,7 +32,8 @@ OPERATION = "f" * 32
 
 class ReadClient:
     def __init__(self, *, ci="passed", workflow="7", permissions=True,
-                 fork=False, stale_after_stage=False):
+                 fork=False, stale_after_stage=False, source=ORIGINAL,
+                 corrected=CORRECTED, file_path=PATH, branch="feature/fix"):
         self.sha = HEAD
         self.branch_sha = HEAD
         self.ci = ci
@@ -40,7 +42,10 @@ class ReadClient:
         self.fork = fork
         self.stale_after_stage = stale_after_stage
         self.after_staging = False
-        self.branch = "feature/fix"
+        self.branch = branch
+        self.source = source
+        self.corrected = corrected
+        self.file_path = file_path
 
     def get_pull(self, ref):
         head_owner = "other" if self.fork else "acme"
@@ -57,11 +62,11 @@ class ReadClient:
 
     def get_file(self, ref, path, sha, *, max_source_bytes):
         if sha == CANDIDATE:
-            return CORRECTED
-        return ORIGINAL
+            return self.corrected
+        return self.source
 
     def get_files(self, ref, *, max_files, max_pages):
-        return ([{"filename": PATH, "status": "modified"}], False, 1, None)
+        return ([{"filename": self.file_path, "status": "modified"}], False, 1, None)
 
     def get_repository(self, owner, repository):
         return {"full_name": f"{owner}/{repository}", "default_branch": "main",
@@ -114,14 +119,14 @@ class APITransport:
                 return {"object": {"sha": CANDIDATE}}
             raise GitHubPRException("github_not_found", 404, "not found")
         if url.endswith("/git/blobs") and method == "POST":
-            assert payload == {"content": CORRECTED, "encoding": "utf-8"}
+            assert payload == {"content": self.read.corrected, "encoding": "utf-8"}
             return {"sha": BLOB}
         if url.endswith("/git/trees") and method == "POST":
             if self.invalid_tree:
                 return {"sha": "invalid", "tree": []}
             assert payload["base_tree"] == TREE
-            assert payload["tree"] == [{"path": PATH, "mode": "100644", "type": "blob", "sha": BLOB}]
-            return {"sha": TREE, "tree": [{"path": PATH, "sha": BLOB}]}
+            assert payload["tree"] == [{"path": self.read.file_path, "mode": "100644", "type": "blob", "sha": BLOB}]
+            return {"sha": TREE, "tree": [{"path": self.read.file_path, "sha": BLOB}]}
         if url.endswith("/git/commits") and method == "POST":
             assert payload["parents"] == [HEAD]
             return {"sha": CANDIDATE, "parents": [{"sha": HEAD}]}
@@ -196,6 +201,10 @@ class FakeFixProvider:
 
 
 def validated_review_response():
+    from dataclasses import replace
+    from mcp_server.orchestrator import _static_review_finding
+    from static_analysis import analyze_python
+
     evidence = RetrievedEvidence(
         evidence_id="rag-1", source_family="test", source_url=None,
         rule_identifier=None, text="Use spaces around assignment operators.",
@@ -214,7 +223,12 @@ def validated_review_response():
     })
     response = parse_review_response(raw, [evidence])
     assert response.valid
-    return response
+    static_findings = tuple(
+        _static_review_finding(item)
+        for item in analyze_python(ORIGINAL, file_path=PATH).findings
+    )
+    return replace(response, findings=(*response.findings, *static_findings),
+                   static_analysis_status="failed" if static_findings else "passed")
 
 
 def finding(**updates):
@@ -241,12 +255,12 @@ def config(**updates):
     return value
 
 
-def review_payload(item=None):
+def review_payload(item=None, *, file_path=PATH, branch="feature/fix"):
     return {
         "repository": "acme/demo", "head_sha": HEAD, "base_sha": "9" * 40,
-        "head_repository": "acme/demo", "head_branch": "feature/fix",
+        "head_repository": "acme/demo", "head_branch": branch,
         "provider_identity": "test-model-v1", "completion_status": "complete", "stale": False,
-        "files": [{"path": PATH, "status": "modified", "evidence": [{"evidence_id": "rag-1"}],
+        "files": [{"path": file_path, "status": "modified", "evidence": [{"evidence_id": "rag-1"}],
                    "findings": [item or finding()]}],
     }
 
@@ -254,9 +268,12 @@ def review_payload(item=None):
 def make_coordinator(tmp_path, *, ci="passed", workflow="7", permissions=True,
                      fork=False, stale_after_stage=False, invalid_tree=False,
                      response_unknown=False, concurrent_ref=None, confidence=None,
-                     staging=True, commits=True, categories=None):
+                     staging=True, commits=True, categories=None, source=ORIGINAL,
+                     corrected=CORRECTED, file_path=PATH, branch="feature/fix",
+                     review_response=None, permitted_branches=None):
     read = ReadClient(ci=ci, workflow=workflow, permissions=permissions, fork=fork,
-                      stale_after_stage=stale_after_stage)
+                      stale_after_stage=stale_after_stage, source=source,
+                      corrected=corrected, file_path=file_path, branch=branch)
     transport = APITransport(read, invalid_tree=invalid_tree,
                               response_unknown=response_unknown, concurrent_ref=concurrent_ref)
     adapter = GitHubMCPActionAdapter(
@@ -269,7 +286,7 @@ def make_coordinator(tmp_path, *, ci="passed", workflow="7", permissions=True,
     evidence = confidence or {
         "calibrated": True, "manifest_verified": True,
         "model_id": "test-model-v1", "dataset_id": "independent-v1",
-        "finding_category": "style", "calibrated_confidence": 0.95,
+        "finding_category": (categories or ("style",))[0], "calibrated_confidence": 0.95,
         "sample_count": 400, "expected_calibration_error": 0.02,
         "artifact_sha256": "1" * 64,
     }
@@ -285,13 +302,132 @@ def make_coordinator(tmp_path, *, ci="passed", workflow="7", permissions=True,
     )
     coordinator = GitHubActionCoordinator(
         store, read_client=read, adapter=adapter,
-        configs={"acme/demo": config(allowed_low_risk_categories=categories or ("style",))},
+        configs={"acme/demo": config(allowed_low_risk_categories=categories or ("style",),
+                                      permitted_branches=permitted_branches or (branch,))},
         autonomous_executor=executor,
     )
     event = {"delivery_id": "delivery-1", "owner": "acme", "repository": "demo",
              "number": 7, "base_sha": "9" * 40, "head_sha": HEAD, "action": "opened"}
-    runtime = {PATH: {"source_code": ORIGINAL, "review_response": validated_review_response()}}
+    runtime = {file_path: {"source_code": source,
+                           "review_response": review_response or validated_review_response()}}
     return coordinator, store, adapter, transport, event, runtime
+
+
+FORMAT_SAMPLE = (
+    "def calculate_total(prices):\n"
+    "    total=0\n"
+    "    for price in prices:\n"
+    "        total+=price\n"
+    "    return total\n"
+)
+FORMAT_CORRECTED = (
+    "def calculate_total(prices):\n"
+    "    total = 0\n"
+    "    for price in prices:\n"
+    "        total+=price\n"
+    "    return total\n"
+)
+FORMAT_PATH = "autocommit_demo/format_example.py"
+FORMAT_BRANCH = "test/autocommit-final"
+
+
+class NoFindingReviewProvider:
+    def analyze_code(self, code, context):
+        return json.dumps({"summary": "No model findings.", "findings": []})
+
+
+class ExactFormattingFixProvider:
+    def generate_fix(self, _source, selected_finding, _context):
+        return json.dumps({
+            "finding_ref": selected_finding.finding_id,
+            "corrected_code": FORMAT_CORRECTED,
+            "explanation": "Add the missing spaces around assignment operators.",
+            "assumptions": [], "evidence_ids": [],
+        })
+
+
+def exact_formatting_case(tmp_path, *, branch=FORMAT_BRANCH, confidence=True):
+    from mcp_server import orchestrator
+
+    response = orchestrator.run_review_pipeline(
+        FORMAT_SAMPLE, file_path=FORMAT_PATH, llm=NoFindingReviewProvider(),
+        retriever=lambda _code: [], notify_desktop=False,
+    ).review_response
+    assert response.valid
+    item = asdict(response.findings[0])
+    item["path"] = FORMAT_PATH
+    confidence_evidence = ({
+        "calibrated": True, "manifest_verified": True,
+        "confidence_source": "independent_calibration",
+        "model_id": "test-model-v1", "dataset_id": "independent-formatting-test-v1",
+        "finding_category": "formatting", "calibrated_confidence": 0.95,
+        "sample_count": 400, "expected_calibration_error": 0.02,
+        "artifact_sha256": "2" * 64,
+    } if confidence else None)
+    coordinator, store, adapter, transport, event, runtime = make_coordinator(
+        tmp_path, confidence=confidence_evidence, categories=("formatting",),
+        source=FORMAT_SAMPLE, corrected=FORMAT_CORRECTED,
+        file_path=FORMAT_PATH, branch=branch, review_response=response,
+        permitted_branches=(FORMAT_BRANCH,),
+    )
+    coordinator.autonomous_executor.fix_generator = lambda validated, finding_id, source: orchestrator.generate_fix_candidate(
+        validated, finding_id, source, llm=ExactFormattingFixProvider(),
+    )
+    payload = review_payload(item, file_path=FORMAT_PATH, branch=branch)
+    payload["files"][0]["evidence"] = []
+    return coordinator, store, adapter, transport, event, runtime, payload
+
+
+def test_exact_pr_formatting_finding_reaches_gated_commit_pipeline(tmp_path):
+    coordinator, store, _adapter, transport, event, runtime, payload = exact_formatting_case(tmp_path)
+    assert payload["files"][0]["findings"][0]["issue_type"] == "formatting"
+    assert payload["files"][0]["findings"][0]["origin"] == "static"
+
+    result = coordinator.process_review(event, payload, runtime_files=runtime)
+
+    action = result["actions"][0]
+    assert action["status"] == "published", action
+    assert action["candidate_sha"] == CANDIDATE
+    assert action["behavioral"]["attestation_verified"] is True
+    assert action["ci"]["status"] == "passed"
+    assert action["confidence"]["confidence_source"] == "independent_calibration"
+    assert store.get_actions("delivery-1")[0]["publication_status"] == "published"
+    assert sum(method == "PATCH" for method, *_ in transport.calls) == 1
+
+
+def test_formatting_finding_still_blocks_without_confidence_evidence(tmp_path):
+    coordinator, _store, _adapter, transport, event, runtime, payload = exact_formatting_case(
+        tmp_path, confidence=False,
+    )
+    coordinator.autonomous_executor.confidence_resolver = lambda _finding: None
+    result = coordinator.process_review(event, payload, runtime_files=runtime)
+    assert result["actions"][0]["reason"] == "confidence_evidence_unavailable"
+    assert not any(method in {"POST", "PATCH"} for method, *_ in transport.calls)
+
+
+def test_formatting_fix_path_blocks_unsupported_category_and_unauthorized_branch(tmp_path):
+    coordinator, _store, _adapter, transport, event, runtime, payload = exact_formatting_case(tmp_path)
+    unsupported = json.loads(json.dumps(payload))
+    unsupported["files"][0]["findings"][0]["issue_type"] = "security"
+    result = coordinator.process_review(event, unsupported, runtime_files=runtime)
+    assert result["actions"][0]["status"] == "review_only"
+    assert not any(method in {"POST", "PATCH"} for method, *_ in transport.calls)
+
+    coordinator, _store, _adapter, transport, event, runtime, payload = exact_formatting_case(
+        tmp_path / "unauthorized", branch="main",
+    )
+    result = coordinator.process_review(event, payload, runtime_files=runtime)
+    assert result["actions"][0]["reason"] == "repository_scope_or_line_limit_denied"
+    assert not any(method in {"POST", "PATCH"} for method, *_ in transport.calls)
+
+
+def test_formatting_fix_path_blocks_when_behavioral_verification_is_missing(tmp_path):
+    coordinator, _store, _adapter, transport, event, runtime, payload = exact_formatting_case(tmp_path)
+    coordinator.autonomous_executor.behavioral_verifier = None
+    coordinator.autonomous_executor.github_behavioral_verifier = None
+    result = coordinator.process_review(event, payload, runtime_files=runtime)
+    assert result["actions"][0]["reason"] == "behavioral_verification_provider_missing_or_ambiguous"
+    assert not any(method in {"POST", "PATCH"} for method, *_ in transport.calls)
 
 
 def test_webhook_review_runs_full_mocked_fix_stage_ci_and_nonforce_commit(tmp_path):

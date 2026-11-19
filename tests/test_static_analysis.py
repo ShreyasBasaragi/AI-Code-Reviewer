@@ -41,6 +41,87 @@ def test_safe_code_has_no_findings():
     assert result.findings == ()
 
 
+def test_exact_pr_formatting_sample_is_detected_deterministically():
+    source = (
+        "def calculate_total(prices):\n"
+        "    total=0\n"
+        "    for price in prices:\n"
+        "        total+=price\n"
+        "    return total\n"
+    )
+    result = analyze_python(source, file_path="autocommit_demo/format_example.py")
+    assert result.status == "failed"
+    assert [(item.rule_id, item.issue_type, item.line_start) for item in result.findings] == [
+        ("PYFMT001", "formatting", 2),
+        ("PYFMT001", "formatting", 4),
+    ]
+    assert all(item.severity == "low" and item.origin == "static" for item in result.findings)
+
+
+def test_formatting_findings_are_added_when_groq_returns_no_findings():
+    source = (
+        "def calculate_total(prices):\n"
+        "    total=0\n"
+        "    for price in prices:\n"
+        "        total+=price\n"
+        "    return total\n"
+    )
+
+    class NoFindingProvider:
+        def analyze_code(self, code, context):
+            return json.dumps({"summary": "No issues found.", "findings": []})
+
+    response = orchestrator.run_review_pipeline(
+        source, file_path="autocommit_demo/format_example.py", llm=NoFindingProvider(),
+        retriever=lambda _code: [], notify_desktop=False,
+    ).review_response
+    assert response.valid
+    assert [(item.issue_type, item.origin, item.line_start) for item in response.findings] == [
+        ("formatting", "static", 2),
+        ("formatting", "static", 4),
+    ]
+
+
+def test_matching_groq_formatting_finding_is_not_duplicated():
+    source = "def calculate_total(prices):\n    total=0\n    return total\n"
+
+    class FormattingReviewProvider:
+        def analyze_code(self, code, context):
+            return json.dumps({"summary": "Formatting issue found.", "findings": [{
+                "title": "Missing spaces around assignment operator",
+                "issue_type": "formatting",
+                "explanation": "The assignment operator on line 2 is missing spaces.",
+                "recommended_fix": "Add spaces around the assignment operator.",
+                "line_start": 2, "line_end": 2, "evidence_ids": [],
+                "uncertain": True, "abstained": False,
+            }]})
+
+    response = orchestrator.run_review_pipeline(
+        source, file_path="autocommit_demo/format_example.py", llm=FormattingReviewProvider(),
+        retriever=lambda _code: [], notify_desktop=False,
+    ).review_response
+    assert response.valid
+    assert len(response.findings) == 1
+    assert response.findings[0].origin == "llm"
+    assert response.findings[0].also_detected_by == ("static",)
+
+
+def test_formatting_category_is_supported_by_groq_schema_and_parser():
+    from review_schema import groq_review_response_format
+
+    raw = json.dumps({"summary": "Formatting review.", "findings": [{
+        "title": "Missing assignment spacing", "issue_type": "formatting",
+        "explanation": "Spaces are missing around the assignment operator.",
+        "recommended_fix": "Add spaces around the assignment operator.",
+        "evidence_ids": [], "uncertain": True, "abstained": False,
+        "verification_status": "not_checked",
+    }]})
+    parsed = parse_review_response(raw)
+    schema_types = groq_review_response_format()["json_schema"]["schema"]["properties"]["findings"]["items"]["properties"]["issue_type"]["enum"]
+    assert parsed.valid and parsed.findings[0].issue_type == "formatting"
+    assert "formatting" in schema_types
+
+
 def test_malformed_python_reports_location_without_findings():
     result = analyze_python("def broken(:\n    pass\n")
     assert result.status == "errored"

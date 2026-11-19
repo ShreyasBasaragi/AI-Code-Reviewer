@@ -650,9 +650,13 @@ def _static_review_finding(item) -> "ReviewFinding":
 
     return ReviewFinding(
         title=item.title,
-        issue_type="security",
+        issue_type=item.issue_type,
         explanation=item.explanation,
-        recommended_fix="Replace this construct with a safer alternative and validate any external input.",
+        recommended_fix=(
+            "Add spaces around the assignment operator."
+            if item.rule_id == "PYFMT001"
+            else "Replace this construct with a safer alternative and validate any external input."
+        ),
         affected_file=item.affected_file,
         line_start=item.line_start,
         line_end=item.line_end,
@@ -737,6 +741,7 @@ def _same_static_issue(llm_finding, static_finding) -> bool:
         "PYSEC003": ("yaml.load", "unsafe yaml", "yaml loader"),
         "PYSEC004": ("shell=true", "shell=True"),
         "PYSEC005": ("os.system",),
+        "PYFMT001": ("assignment operator", "spaces around", "missing spaces"),
     }
     return any(cue.casefold() in text for cue in cues.get(static_finding.rule_id or "", ()))
 

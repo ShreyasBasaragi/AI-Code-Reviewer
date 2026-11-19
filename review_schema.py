@@ -14,7 +14,7 @@ REVIEW_OUTPUT_INSTRUCTIONS = """Return exactly one JSON object with this shape:
   "findings": [
     {
       "title": "short issue title",
-      "issue_type": "bug | security | performance | style | other",
+      "issue_type": "bug | security | performance | style | formatting | other",
       "explanation": "why this is a concern, grounded in the supplied code",
       "affected_file": null,
       "line_start": null,
@@ -60,7 +60,7 @@ def review_json_schema() -> dict[str, Any]:
     """
     finding_properties = {
         "title": {"type": "string"},
-        "issue_type": {"type": "string", "enum": ["bug", "security", "performance", "style", "other"]},
+        "issue_type": {"type": "string", "enum": ["bug", "security", "performance", "style", "formatting", "other"]},
         "explanation": {"type": "string"},
         "recommended_fix": {"type": "string"},
         "affected_file": _nullable_json_type("string"),
@@ -282,7 +282,7 @@ def parse_review_response(
             ):
                 raise ValueError(f"finding_{index}: required_text_field_missing_or_invalid")
             if item["issue_type"].casefold() not in {
-                "bug", "security", "performance", "style", "other"
+                "bug", "security", "performance", "style", "formatting", "other"
             }:
                 raise ValueError(f"finding_{index}: unsupported_issue_type")
 
