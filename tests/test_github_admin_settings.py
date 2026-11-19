@@ -21,6 +21,12 @@ class FakeKeychain:
         self.values.pop(name, None)
 
 
+class FailingKeychain(FakeKeychain):
+    def get(self, name):
+        from mcp_server.credential_store import CredentialStoreError
+        raise CredentialStoreError("secure_credential_store_read_failed")
+
+
 class FakeGitHubClient:
     calls = []
 
@@ -56,6 +62,100 @@ def make_client(tmp_path, monkeypatch):
     client = TestClient(create_app(admin_auth=auth, credentials=credentials))
     client.cookies.set("acr_admin_session", token, path="/")
     return client, auth, credentials, {"Origin": "http://127.0.0.1:5173"}
+
+
+def startup_capabilities(tmp_path, monkeypatch, keychain, *, write_enabled=True, env_tokens=None):
+    import mcp_server.http_api as http_api
+    from mcp_server.state import LifecycleState
+
+    for name in CredentialStore.ENVIRONMENT.values():
+        monkeypatch.delenv(name, raising=False)
+    for name, value in (env_tokens or {}).items():
+        monkeypatch.setenv(name, value)
+    switch_value = "true" if write_enabled else "false"
+    monkeypatch.setenv("GITHUB_CANDIDATE_STAGING_ENABLED", switch_value)
+    monkeypatch.setenv("GITHUB_AUTONOMOUS_COMMIT_ENABLED", switch_value)
+    monkeypatch.setenv("AI_CODE_REVIEWER_WEBHOOK_DB_PATH", str(tmp_path / "webhooks.sqlite3"))
+    monkeypatch.setenv("AI_CODE_REVIEWER_LIFECYCLE_DB_PATH", str(tmp_path / "lifecycle.sqlite3"))
+    monkeypatch.setenv("GITHUB_ACTION_POLICY_PATH", str(tmp_path / "policy.json"))
+    credentials = CredentialStore(keychain)
+    app = http_api.create_app(service=http_api.ReviewFixService(state=LifecycleState()),
+                              admin_auth=AdminAuthStore(tmp_path / "admin.sqlite3"),
+                              credentials=credentials)
+    with TestClient(app) as client:
+        return client.get("/api/verification/capabilities")
+
+
+def test_startup_loads_stored_action_credentials_and_reports_capabilities(tmp_path, monkeypatch):
+    secrets = {
+        "github_token": "read-secret",
+        "github_actions_token": "actions-secret",
+        "github_candidate_staging_token": "staging-secret",
+        "github_autonomous_commit_token": "commit-secret",
+    }
+    # Populate an actual mock Keychain and construct a fresh app so the test
+    # models credentials saved before backend startup.
+    keychain = FakeKeychain()
+    keychain.values.update(secrets)
+    response = startup_capabilities(tmp_path, monkeypatch, keychain)
+    assert response.status_code == 200
+    assert response.json()["candidate_staging"] == "enabled"
+    assert response.json()["commit_execution"] == "enabled_but_fail_closed_gates_required"
+    assert all(secret not in response.text for secret in secrets.values())
+
+
+def test_startup_without_credentials_keeps_write_capabilities_disabled(tmp_path, monkeypatch):
+    response = startup_capabilities(tmp_path, monkeypatch, FakeKeychain())
+    assert response.status_code == 200
+    assert response.json()["candidate_staging"] == "disabled_or_credential_missing"
+    assert response.json()["commit_execution"] == "disabled_by_default_or_credential_missing"
+
+
+def test_startup_keychain_read_failure_is_safe_and_fail_closed(tmp_path, monkeypatch):
+    response = startup_capabilities(
+        tmp_path, monkeypatch, FailingKeychain(),
+        env_tokens={
+            "GITHUB_ACTIONS_TOKEN": "actions-env-secret",
+            "GITHUB_CANDIDATE_STAGING_TOKEN": "staging-env-secret",
+            "GITHUB_AUTONOMOUS_COMMIT_TOKEN": "commit-env-secret",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["candidate_staging"] == "disabled_or_credential_missing"
+    assert response.json()["commit_execution"] == "disabled_by_default_or_credential_missing"
+    assert "secure_credential_store_read_failed" not in response.text
+
+
+def test_write_capabilities_remain_disabled_when_switches_are_off(tmp_path, monkeypatch):
+    keychain = FakeKeychain()
+    keychain.values.update({
+        "github_candidate_staging_token": "staging-secret",
+        "github_autonomous_commit_token": "commit-secret",
+    })
+    response = startup_capabilities(tmp_path, monkeypatch, keychain, write_enabled=False)
+    assert response.status_code == 200
+    assert response.json()["candidate_staging"] == "disabled_or_credential_missing"
+    assert response.json()["commit_execution"] == "disabled_by_default_or_credential_missing"
+
+
+def test_frontend_credential_updates_refresh_capabilities_without_exposing_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_CANDIDATE_STAGING_ENABLED", "true")
+    monkeypatch.setenv("GITHUB_AUTONOMOUS_COMMIT_ENABLED", "true")
+    client, _auth, _credentials, headers = make_client(tmp_path, monkeypatch)
+    for credential_type, value in (
+        ("github_candidate_staging_token", "new-staging-secret"),
+        ("github_autonomous_commit_token", "new-commit-secret"),
+    ):
+        saved = client.put("/api/admin/github/credentials", headers=headers,
+                           json={"credential_type": credential_type, "value": value,
+                                 "persistent": True})
+        assert saved.status_code == 200
+        assert value not in saved.text
+    capabilities = client.get("/api/verification/capabilities")
+    assert capabilities.json()["candidate_staging"] == "enabled"
+    assert capabilities.json()["commit_execution"] == "enabled_but_fail_closed_gates_required"
+    assert "new-staging-secret" not in capabilities.text
+    assert "new-commit-secret" not in capabilities.text
 
 
 def test_github_credentials_are_redacted_and_connection_test_is_explicit(tmp_path, monkeypatch):

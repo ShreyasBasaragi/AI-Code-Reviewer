@@ -485,6 +485,14 @@ def create_app(service: Optional[ReviewFixService] = None,
         if lifecycle.state.persistence_store is not None:
             lifecycle.state.persistence_store.initialize()
         delivery_store.initialize()
+        try:
+            _apply_github_credentials(lifecycle, credential_store, action_coordinator, include_action=True)
+        except HTTPException:
+            # Keychain read errors must not prevent the read-only application
+            # from starting, and must never leave environment-initialized write
+            # tokens usable. A later successful credential update/webhook can
+            # populate the adapter through the normal credential path.
+            _clear_github_credentials(lifecycle, action_coordinator)
         _print_startup_summary(auth_store, credential_store, bootstrap)
         try:
             webhook_configured = bool(credential_store.get("webhook_secret"))
@@ -1517,15 +1525,34 @@ def _apply_github_credentials(lifecycle: ReviewFixService, credentials: Credenti
                               action_coordinator: GitHubActionCoordinator, *, include_action: bool = False) -> None:
     client = getattr(getattr(lifecycle, "github_pr_service", None), "client", None)
     try:
-        if isinstance(client, GitHubRESTClient):
-            client.token = credentials.get("github_token")
-        adapter = getattr(action_coordinator, "adapter", None)
-        if include_action and adapter is not None:
-            adapter.token = credentials.get("github_actions_token")
-            adapter.staging_token = credentials.get("github_candidate_staging_token")
-            adapter.commit_token = credentials.get("github_autonomous_commit_token")
+        github_token = credentials.get("github_token") if isinstance(client, GitHubRESTClient) else None
+        action_tokens = None
+        if include_action:
+            action_tokens = (
+                credentials.get("github_actions_token"),
+                credentials.get("github_candidate_staging_token"),
+                credentials.get("github_autonomous_commit_token"),
+            )
     except CredentialStoreError as exc:
         raise HTTPException(status_code=503, detail="github_credential_store_unavailable") from exc
+    if isinstance(client, GitHubRESTClient):
+        client.token = github_token
+    adapter = getattr(action_coordinator, "adapter", None)
+    if include_action and adapter is not None:
+        adapter.token, adapter.staging_token, adapter.commit_token = action_tokens
+
+
+def _clear_github_credentials(lifecycle: ReviewFixService,
+                              action_coordinator: GitHubActionCoordinator) -> None:
+    """Clear tokens after a failed startup read, preserving fail-closed writes."""
+    client = getattr(getattr(lifecycle, "github_pr_service", None), "client", None)
+    if isinstance(client, GitHubRESTClient):
+        client.token = None
+    adapter = getattr(action_coordinator, "adapter", None)
+    if adapter is not None:
+        adapter.token = None
+        adapter.staging_token = None
+        adapter.commit_token = None
 
 
 app = create_app()
