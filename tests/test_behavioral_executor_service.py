@@ -7,6 +7,7 @@ import hmac
 import json
 import subprocess
 import time
+from pathlib import Path
 
 import pytest
 
@@ -16,6 +17,18 @@ from mcp_server.behavioral_verification import RemoteHTTPSExecutionBroker
 
 KEY = "executor-test-key-with-at-least-thirty-two-bytes"
 IMAGE = "registry.example/codementor-runner@sha256:" + "a" * 64
+
+
+def test_trusted_runner_image_installs_and_checks_git():
+    dockerfile_path = (
+        Path(__file__).resolve().parents[1]
+        / "deploy/behavioral_executor/Dockerfile"
+    )
+    dockerfile = dockerfile_path.read_text(encoding="utf-8")
+    normalized = dockerfile.replace("\\\n", " ")
+
+    assert "apt-get install -y --no-install-recommends git" in normalized
+    assert "git --version" in normalized
 
 
 def _test_bundle():
