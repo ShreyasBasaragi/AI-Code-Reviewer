@@ -21,6 +21,8 @@ class AutonomousFixExecutor:
                  fix_generator: Callable[[Any, str, str], FixCandidate],
                  confidence_resolver: Callable[[Mapping[str, Any]], Optional[Mapping[str, Any]]],
                  behavioral_verifier: Optional[BehavioralVerifier] = None,
+                 github_behavioral_verifier: Optional[Any] = None,
+                 github_hosted_commit_policy: Optional[str] = None,
                  behavioral_tests: Optional[Callable[[str], bytes]] = None,
                  workflow_identity: Optional[str] = None) -> None:
         self.store = store
@@ -28,6 +30,11 @@ class AutonomousFixExecutor:
         self.fix_generator = fix_generator
         self.confidence_resolver = confidence_resolver
         self.behavioral_verifier = behavioral_verifier
+        self.github_behavioral_verifier = github_behavioral_verifier
+        self.github_hosted_commit_policy = (
+            github_hosted_commit_policy if github_hosted_commit_policy is not None else
+            os.getenv("GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY", "")
+        ).strip().casefold()
         self.behavioral_tests = behavioral_tests
         self.workflow_identity = workflow_identity or os.getenv("GITHUB_CANDIDATE_WORKFLOW_ID")
 
@@ -104,24 +111,31 @@ class AutonomousFixExecutor:
         if (review.get("head_branch") not in config.permitted_branches
                 or changed_lines is None or changed_lines > min(3, config.max_changed_lines)):
             return blocked("repository_scope_or_line_limit_denied")
-        if self.behavioral_verifier is None or not callable(self.behavioral_tests):
-            return blocked("isolated_behavioral_verification_unavailable")
-        try:
-            test_bundle = self.behavioral_tests(path)
-        except Exception:
-            return blocked("behavioral_test_bundle_unavailable")
-        if not isinstance(test_bundle, bytes) or not test_bundle:
-            return blocked("behavioral_test_bundle_empty")
-        verification = self.behavioral_verifier.verify(
-            original_source=original_code.encode("utf-8"),
-            candidate_source=candidate.corrected_code.encode("utf-8"),
-            expected_source_sha256=hashlib.sha256(original_code.encode("utf-8")).hexdigest(),
-            tests=test_bundle, changed_files=(path,),
-        )
-        behavioral_evidence = verification.to_dict()
-        if verification.status != "passed" or verification.attestation_verified is not True:
-            return blocked("behavioral_verification_not_attested", verification_status=verification.status,
-                           behavioral_evidence=behavioral_evidence)
+        if ((self.behavioral_verifier is None and self.github_behavioral_verifier is None)
+                or (self.behavioral_verifier is not None and self.github_behavioral_verifier is not None)):
+            return blocked("behavioral_verification_provider_missing_or_ambiguous")
+        verification = None
+        behavioral_evidence: dict[str, Any] = {"status": "not_run", "attestation_verified": False}
+        if self.behavioral_verifier is not None:
+            if not callable(self.behavioral_tests):
+                return blocked("isolated_behavioral_test_bundle_unavailable")
+            try:
+                test_bundle = self.behavioral_tests(path)
+            except Exception:
+                return blocked("behavioral_test_bundle_unavailable")
+            if not isinstance(test_bundle, bytes) or not test_bundle:
+                return blocked("behavioral_test_bundle_empty")
+            verification = self.behavioral_verifier.verify(
+                original_source=original_code.encode("utf-8"),
+                candidate_source=candidate.corrected_code.encode("utf-8"),
+                expected_source_sha256=hashlib.sha256(original_code.encode("utf-8")).hexdigest(),
+                tests=test_bundle, changed_files=(path,),
+            )
+            behavioral_evidence = verification.to_dict()
+            if verification.status != "passed" or verification.attestation_verified is not True:
+                return blocked("behavioral_verification_not_attested", verification_status=verification.status,
+                               behavioral_evidence=behavioral_evidence)
+        precommit_verification_status = "behavioral_passed" if verification is not None else "behavioral_pending"
         created = self.adapter.create_candidate_revision(
             ref, repository=repo, branch=str(review.get("head_branch")),
             expected_head_sha=str(head_sha), file_path=path, original_code=original_code,
@@ -130,29 +144,29 @@ class AutonomousFixExecutor:
         if created.get("status") != "created":
             if created.get("status") == "unknown":
                 self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
-                                                 verification_status="behavioral_passed", details={
+                                                 verification_status=precommit_verification_status, details={
                                                      "candidate": created,
                                                      "branch": review.get("head_branch"),
                                                      "staging_outcome_unknown": True,
                                                  })
                 self.store.finish_action(action_id, "requires_reconciliation",
                                          failure_code=str(created.get("error_code", "candidate_stage_unknown")),
-                                         verification_status="behavioral_passed")
+                                         verification_status=precommit_verification_status)
                 return {"status": "unknown", "reason": created.get("error_code"),
                         "candidate": created, "manual_review_fallback": True}
             return blocked(str(created.get("error_code", "candidate_revision_creation_failed")),
-                           candidate=created, verification_status="behavioral_passed")
+                           candidate=created, verification_status=precommit_verification_status)
         self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
-                                         verification_status="behavioral_passed", details={
+                                         verification_status=precommit_verification_status, details={
                                              "candidate": created,
                                              "branch": review.get("head_branch"),
                                          })
         required_github_checks = tuple(config.required_github_checks)
         if not required_github_checks or not self.workflow_identity:
             return blocked("candidate_ci_workflow_or_required_checks_unconfigured",
-                           candidate=created, verification_status="behavioral_passed")
+                           candidate=created, verification_status=precommit_verification_status)
         self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
-                                         verification_status="behavioral_passed", details={
+                                         verification_status=precommit_verification_status, details={
                                              "candidate": created,
                                              "branch": review.get("head_branch"),
                                              "workflow_dispatch_attempted": True,
@@ -167,27 +181,63 @@ class AutonomousFixExecutor:
             if dispatch.get("status") == "unknown":
                 self.store.finish_action(action_id, "requires_reconciliation",
                                          failure_code=str(dispatch.get("error_code", "candidate_ci_dispatch_unknown")),
-                                         verification_status="behavioral_passed")
+                                         verification_status=precommit_verification_status)
                 return {"status": "unknown", "reason": dispatch.get("error_code"),
                         "candidate": created, "ci_dispatch": dispatch,
                         "manual_review_fallback": True}
             return blocked(str(dispatch.get("error_code", "candidate_ci_dispatch_failed")),
                            candidate=created, ci_dispatch=dispatch,
-                           verification_status="behavioral_passed")
+                           verification_status=precommit_verification_status)
+        if (not isinstance(dispatch.get("workflow_run_branch"), str)
+                or isinstance(dispatch.get("dispatched_at"), bool)
+                or not isinstance(dispatch.get("dispatched_at"), (int, float))):
+            return blocked("candidate_ci_dispatch_identity_unavailable", candidate=created,
+                           ci_dispatch=dispatch, verification_status=precommit_verification_status)
         ci = self.adapter.verify_candidate_ci(
             ref, candidate_sha=created["candidate_sha"], expected_pr_head_sha=str(head_sha),
             required_checks=required_github_checks,
             expected_workflow_identity=self.workflow_identity,
+            workflow_run_branch=dispatch.get("workflow_run_branch"),
+            dispatched_after=dispatch.get("dispatched_at"),
         )
         if ci.get("status") != "passed":
             self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
-                                             verification_status="behavioral_passed", details={
+                                             verification_status=precommit_verification_status, details={
                                                  "candidate": created, "ci": ci,
                                              "ci_dispatch": dispatch,
                                                  "branch": review.get("head_branch"),
                                              })
             return blocked(str(ci.get("error_code", "candidate_ci_not_passed")),
-                           candidate=created, ci=ci, verification_status="behavioral_passed")
+                           candidate=created, ci=ci, verification_status=precommit_verification_status)
+        if self.github_behavioral_verifier is not None:
+            try:
+                verification = self.github_behavioral_verifier.verify(
+                    original_source=original_code.encode("utf-8"),
+                    candidate_source=candidate.corrected_code.encode("utf-8"),
+                    expected_source_sha256=hashlib.sha256(original_code.encode("utf-8")).hexdigest(),
+                    changed_files=(path,), repository=repo,
+                    candidate_commit_sha=created["candidate_sha"], parent_sha=str(head_sha),
+                    source_workflow_id=self.workflow_identity,
+                    source_workflow_run_id=ci.get("workflow_run_id"),
+                )
+            except Exception:
+                verification = None
+            behavioral_evidence = verification.to_dict() if verification is not None else {
+                "status": "errored", "attestation_verified": False,
+                "error_code": "github_behavioral_verifier_error",
+            }
+            if (verification is None or verification.status != "passed"
+                    or verification.attestation_verified is not True
+                    or verification.candidate_commit_sha != created["candidate_sha"]):
+                self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
+                                                 verification_status="behavioral_failed", details={
+                                                     "candidate": created, "ci": ci,
+                                                     "behavioral": behavioral_evidence,
+                                                 })
+                return blocked("github_hosted_behavioral_verification_not_attested",
+                               candidate=created, ci=ci,
+                               verification_status=behavioral_evidence.get("status"),
+                               behavioral_evidence=behavioral_evidence)
         policy = evaluate_finding({repo.casefold(): config}, PolicyInput(
             repository=repo, finding=finding, expected_head_sha=str(head_sha),
             current_head_sha=review.get("head_sha"), changed_lines=changed_lines,
@@ -241,6 +291,35 @@ class AutonomousFixExecutor:
                     "behavioral": behavioral_evidence,
                     "confidence": dict(confidence),
                     "commit_sha": None, "manual_review_fallback": True}
+        if self.github_behavioral_verifier is not None:
+            # This explicitly selected prototype policy accepts the weaker
+            # hosted Docker boundary while retaining every other independent
+            # gate. Empty, unknown, or misspelled values remain staging-only.
+            if (self.github_hosted_commit_policy != "prototype"
+                    or behavioral_evidence.get("isolation") != "github_hosted_docker"):
+                self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
+                                                 verification_status="passed", details={
+                                                     "candidate": created, "behavioral": behavioral_evidence,
+                                                     "ci": ci, "ci_dispatch": dispatch,
+                                                     "confidence": dict(confidence),
+                                                     "changed_lines": changed_lines,
+                                                     "branch": review.get("head_branch"),
+                                                     "commit_attempted": False,
+                                                     "final_commit_disabled": True,
+                                                     "final_commit_block_reason": "github_hosted_prototype_policy_not_selected",
+                                                 })
+                self.store.finish_action(action_id, "AUTONOMOUS_COMMIT_DISABLED",
+                                         failure_code="github_hosted_prototype_policy_not_selected",
+                                         verification_status="passed")
+                return {"status": "AUTONOMOUS_COMMIT_DISABLED",
+                        "reason": "github_hosted_prototype_policy_not_selected",
+                        "candidate_id": candidate.candidate_id,
+                        "candidate_sha": created["candidate_sha"],
+                        "candidate_branch": created["candidate_branch"],
+                        "ci_dispatch": dispatch, "ci": ci,
+                        "behavioral": behavioral_evidence,
+                        "confidence": dict(confidence),
+                        "commit_sha": None, "manual_review_fallback": True}
         self.store.update_action_details(action_id, candidate_id=candidate.candidate_id,
                                          verification_status="passed", details={
                                              "candidate": created, "behavioral": behavioral_evidence,

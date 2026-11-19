@@ -42,6 +42,7 @@ class BehavioralVerificationResult:
     test_identity: Optional[str] = None
     verifier_id: Optional[str] = None
     attestation_verified: bool = False
+    candidate_commit_sha: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -264,6 +265,134 @@ class BehavioralVerifier:
             test_identity=report.get("test_identity"), verifier_id=report.get("verifier_id"),
             attestation_verified=True,
         )
+
+
+class GitHubActionsBehavioralVerifier:
+    """Read and verify a signed result produced by the trusted workflow_run workflow.
+
+    Candidate code is never run by this process. The fetcher must retrieve a
+    single artifact from the configured attestation workflow, bound to the
+    exact candidate workflow run and commit.
+    """
+
+    def __init__(self, fetch_attestation, *, key: Optional[str] = None,
+                 expected_test_identity: Optional[str] = None,
+                 attestation_workflow_id: Optional[str] = None,
+                 max_age_seconds: int = 1800) -> None:
+        self.fetch_attestation = fetch_attestation
+        self.key = (key if key is not None else
+                    os.getenv("GITHUB_BEHAVIORAL_ATTESTATION_HMAC_KEY", "")).encode()
+        self.expected_test_identity = (expected_test_identity if expected_test_identity is not None
+                                       else os.getenv("GITHUB_BEHAVIORAL_TEST_BUNDLE_SHA256", ""))
+        self.attestation_workflow_id = (attestation_workflow_id if attestation_workflow_id is not None
+                                        else os.getenv("GITHUB_BEHAVIORAL_ATTESTATION_WORKFLOW_ID", ""))
+        self.max_age_seconds = min(max(int(max_age_seconds), 60), 3600)
+
+    def verify(self, *, original_source: bytes, candidate_source: bytes,
+               expected_source_sha256: str, changed_files: tuple[str, ...],
+               repository: str, candidate_commit_sha: str, parent_sha: str,
+               source_workflow_id: str, source_workflow_run_id: int) -> BehavioralVerificationResult:
+        original_hash = hashlib.sha256(original_source).hexdigest() if isinstance(original_source, bytes) else None
+        candidate_hash = hashlib.sha256(candidate_source).hexdigest() if isinstance(candidate_source, bytes) else None
+        failed = lambda code: BehavioralVerificationResult(
+            "errored", "github_hosted_unverified", original_hash, candidate_hash,
+            changed_files if isinstance(changed_files, tuple) else (), error_code=code,
+            candidate_commit_sha=candidate_commit_sha if isinstance(candidate_commit_sha, str) else None,
+        )
+        if (len(self.key) < 32 or not re.fullmatch(r"[0-9a-f]{64}", self.expected_test_identity or "")
+                or not re.fullmatch(r"[0-9]{1,20}", self.attestation_workflow_id or "")
+                or not isinstance(original_source, bytes) or not isinstance(candidate_source, bytes)
+                or len(original_source) > MAX_SOURCE_BYTES or len(candidate_source) > MAX_SOURCE_BYTES
+                or original_hash != expected_source_sha256
+                or not isinstance(repository, str)
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repository)
+                or not re.fullmatch(r"[0-9a-fA-F]{40,64}", candidate_commit_sha or "")
+                or not re.fullmatch(r"[0-9a-fA-F]{40,64}", parent_sha or "")
+                or not isinstance(source_workflow_id, str)
+                or not re.fullmatch(r"[0-9]{1,20}", source_workflow_id)
+                or isinstance(source_workflow_run_id, bool) or not isinstance(source_workflow_run_id, int)
+                or source_workflow_run_id <= 0 or not _safe_relative_path_tuple(changed_files)):
+            return failed("github_behavioral_configuration_or_identity_invalid")
+        try:
+            report = self.fetch_attestation(
+                repository=repository, source_workflow_id=source_workflow_id,
+                source_workflow_run_id=source_workflow_run_id,
+                candidate_commit_sha=candidate_commit_sha,
+                attestation_workflow_id=self.attestation_workflow_id,
+            )
+        except Exception as exc:
+            return failed(f"github_behavioral_evidence_{type(exc).__name__}")
+        if not isinstance(report, Mapping):
+            return failed("github_behavioral_evidence_missing_or_ambiguous")
+        signature = report.get("signature")
+        unsigned = {key: value for key, value in report.items() if key != "signature"}
+        expected_signature = hmac.new(
+            self.key, json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode(), hashlib.sha256
+        ).hexdigest()
+        issued_at = report.get("issued_at")
+        claimed_repository = report.get("repository")
+        claimed_candidate_sha = report.get("candidate_sha")
+        claimed_parent_sha = report.get("parent_sha")
+        claimed_attestation_run_id = report.get("attestation_run_id")
+        common_valid = (
+            isinstance(signature, str) and hmac.compare_digest(signature, expected_signature)
+            and report.get("version") == "codementor-github-behavioral-v1"
+            and isinstance(claimed_repository, str)
+            and claimed_repository.casefold() == repository.casefold()
+            and report.get("source_workflow_id") == source_workflow_id
+            and report.get("source_workflow_run_id") == source_workflow_run_id
+            and isinstance(claimed_candidate_sha, str)
+            and claimed_candidate_sha.casefold() == candidate_commit_sha.casefold()
+            and isinstance(claimed_parent_sha, str)
+            and claimed_parent_sha.casefold() == parent_sha.casefold()
+            and report.get("changed_files") == list(changed_files)
+            and report.get("source_sha256") == candidate_hash
+            and report.get("test_identity") == self.expected_test_identity
+            and report.get("attestation_workflow_id") == self.attestation_workflow_id
+            and isinstance(claimed_attestation_run_id, int) and not isinstance(claimed_attestation_run_id, bool)
+            and isinstance(issued_at, (int, float)) and not isinstance(issued_at, bool)
+            and 0 <= time.time() - float(issued_at) <= self.max_age_seconds
+            and report.get("credentials_injected") is False
+            and report.get("network_isolated") is True
+            and report.get("filesystem_restricted") is True
+            and report.get("timeout_enforced") is True
+            and report.get("execution_mode") == "github_hosted_docker"
+        )
+        if not common_valid:
+            return failed("github_behavioral_attestation_invalid_or_stale")
+        status = report.get("status")
+        if not isinstance(status, str) or status not in {"passed", "failed", "timeout", "errored"}:
+            return failed("github_behavioral_status_invalid")
+        exit_code = report.get("exit_code")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            return failed("github_behavioral_status_invalid")
+        if status != "passed" or exit_code != 0:
+            result_status = ("failed" if status in {"failed", "timeout"}
+                             or (status == "passed" and exit_code != 0)
+                             else "errored")
+            return BehavioralVerificationResult(
+                result_status, "github_hosted_docker",
+                original_hash, candidate_hash, changed_files, executed=True,
+                exit_code=report.get("exit_code") if isinstance(report.get("exit_code"), int) else None,
+                error_code="github_behavioral_tests_not_passed",
+                test_identity=self.expected_test_identity,
+                verifier_id=f"github-actions:{self.attestation_workflow_id}",
+                attestation_verified=True, candidate_commit_sha=candidate_commit_sha,
+            )
+        return BehavioralVerificationResult(
+            "passed", "github_hosted_docker", original_hash, candidate_hash,
+            changed_files, executed=True, exit_code=0,
+            duration_seconds=report.get("duration_seconds") if isinstance(report.get("duration_seconds"), (int, float)) else None,
+            output_excerpt=_bounded_output(report.get("output_excerpt")),
+            test_identity=self.expected_test_identity,
+            verifier_id=f"github-actions:{self.attestation_workflow_id}",
+            attestation_verified=True, candidate_commit_sha=candidate_commit_sha,
+        )
+
+
+def _safe_relative_path_tuple(paths: Any) -> bool:
+    return (isinstance(paths, tuple) and len(paths) == 1
+            and all(_safe_relative_path(path) for path in paths))
 
 
 def _bounded_output(value: Any) -> str:

@@ -18,6 +18,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 import time
+from datetime import datetime, timezone
 
 from mcp_server.github_pr import API_BASE, API_VERSION, GitHubPRException, PullRequestRef
 from mcp_server.github_policy import commit_execution_decision
@@ -32,6 +33,16 @@ from static_analysis import analyze_python, static_fingerprint_counts
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
+
+
+def _workflow_run_created_after(value: Any, timestamp: float) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc).timestamp() >= timestamp
+    except (ValueError, OverflowError):
+        return False
 
 
 @dataclass(frozen=True)
@@ -297,7 +308,9 @@ class GitHubMCPActionAdapter:
     def verify_candidate_ci(self, ref: PullRequestRef, *, candidate_sha: str,
                             expected_pr_head_sha: str,
                             required_checks: tuple[str, ...],
-                            expected_workflow_identity: Optional[str] = None) -> dict[str, Any]:
+                            expected_workflow_identity: Optional[str] = None,
+                            workflow_run_branch: Optional[str] = None,
+                            dispatched_after: Optional[float] = None) -> dict[str, Any]:
         """Verify named checks on a candidate SHA, never infer from the old PR head."""
         if candidate_sha == expected_pr_head_sha:
             return {"status": "unknown", "candidate_sha": candidate_sha,
@@ -314,7 +327,10 @@ class GitHubMCPActionAdapter:
             if expected_workflow_identity is None:
                 ci_fetch = lambda sha: fetch(ref, sha)
             else:
-                ci_fetch = lambda sha: fetch(ref, sha, expected_workflow_identity)
+                ci_fetch = lambda sha: fetch(
+                    ref, sha, expected_workflow_identity,
+                    workflow_run_branch=workflow_run_branch, dispatched_after=dispatched_after,
+                )
             ci_client = GitHubCIClient(ci_fetch)
             deadline = time.monotonic() + _candidate_ci_wait_seconds()
             while True:
@@ -342,7 +358,42 @@ class GitHubMCPActionAdapter:
                 return {"status": "unknown", "candidate_sha": candidate_sha,
                         "checks": [], "error_code": "pr_head_changed_during_ci_verification"}
             value = report.to_dict()
+            run_id = None
+            if workflow_run_branch is not None or dispatched_after is not None:
+                response = ci_fetch(candidate_sha)
+                runs = response.get("workflow_runs") if isinstance(response, Mapping) else None
+                exact_runs = [run for run in runs if isinstance(run, Mapping)
+                              and run.get("workflow_id") == int(expected_workflow_identity or "0")
+                              and run.get("head_sha") == candidate_sha
+                              and run.get("event") == "workflow_dispatch"
+                              and run.get("head_branch") == workflow_run_branch
+                              and isinstance(dispatched_after, (int, float))
+                              and run.get("display_title") == f"CodeMentor candidate verification {candidate_sha}"
+                              and run.get("candidate_sha") == candidate_sha
+                              and _workflow_run_created_after(run.get("created_at"), dispatched_after)] if isinstance(runs, list) else []
+                if len(exact_runs) != 1:
+                    return {**value, "status": "unknown", "workflow_identity": expected_workflow_identity,
+                            "error_code": "candidate_workflow_run_missing_stale_or_ambiguous"}
+                run_status = exact_runs[0].get("status")
+                run_conclusion = exact_runs[0].get("conclusion")
+                if run_status != "completed":
+                    if run_status in {"queued", "in_progress", "requested", "pending"}:
+                        return {**value, "status": "pending", "workflow_identity": expected_workflow_identity,
+                                "workflow_run_id": exact_runs[0].get("id")}
+                    return {**value, "status": "unknown", "workflow_identity": expected_workflow_identity,
+                            "error_code": "candidate_workflow_run_status_invalid"}
+                if run_conclusion != "success":
+                    return {**value, "status": "failed" if run_conclusion in {
+                        "failure", "timed_out", "cancelled", "action_required", "startup_failure"
+                    } else "unknown", "workflow_identity": expected_workflow_identity,
+                        "error_code": "candidate_workflow_run_not_successful"}
+                run_id = exact_runs[0].get("id")
+                if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+                    return {**value, "status": "unknown", "workflow_identity": expected_workflow_identity,
+                            "error_code": "candidate_workflow_run_identity_invalid"}
             value["workflow_identity"] = expected_workflow_identity
+            if run_id is not None:
+                value["workflow_run_id"] = run_id
             return value
         except Exception as exc:
             return {"status": "unknown", "candidate_sha": candidate_sha,
@@ -368,22 +419,35 @@ class GitHubMCPActionAdapter:
             staged_sha = ref_result.get("object", {}).get("sha") if isinstance(ref_result, dict) else None
             if staged_sha != candidate_sha:
                 return {"status": "stale", "error_code": "candidate_ref_sha_mismatch"}
+            repository_info = self.read_client.get_repository(ref.owner, ref.repository)
+            workflow_run_branch = repository_info.get("default_branch") if isinstance(repository_info, dict) else None
+            if not isinstance(workflow_run_branch, str) or not re.fullmatch(r"[A-Za-z0-9_.\-/]{1,200}", workflow_run_branch):
+                return {"status": "blocked", "error_code": "trusted_workflow_default_branch_unavailable"}
+            # Take the lower-bound timestamp immediately before dispatch so an
+            # older same-SHA run cannot be mistaken for this dispatch.
+            dispatch_started_at = time.time()
             self._api_call(
                 "POST", self._repo_path(ref) + "/actions/workflows/"
                 + urllib.parse.quote(workflow_identity, safe="") + "/dispatches",
-                {"ref": candidate_branch, "inputs": {"candidate_sha": candidate_sha}},
+                {"ref": workflow_run_branch, "inputs": {"candidate_sha": candidate_sha}},
                 token=self.staging_token,
             )
             return {"status": "dispatched", "candidate_sha": candidate_sha,
-                    "candidate_branch": candidate_branch, "workflow_identity": workflow_identity}
+                    "candidate_branch": candidate_branch, "workflow_identity": workflow_identity,
+                    "workflow_run_branch": workflow_run_branch,
+                    "dispatched_at": dispatch_started_at}
         except GitHubPRException as exc:
             status = "unknown" if exc.code in {"github_timeout", "github_network_error", "github_unavailable"} else "failed"
             return {"status": status, "candidate_sha": candidate_sha,
                     "candidate_branch": candidate_branch, "workflow_identity": workflow_identity,
+                    "workflow_run_branch": locals().get("workflow_run_branch"),
+                    "dispatched_at": locals().get("dispatch_started_at"),
                     "error_code": exc.code}
         except Exception as exc:
             return {"status": "unknown", "candidate_sha": candidate_sha,
                     "candidate_branch": candidate_branch, "workflow_identity": workflow_identity,
+                    "workflow_run_branch": locals().get("workflow_run_branch"),
+                    "dispatched_at": locals().get("dispatch_started_at"),
                     "error_code": f"workflow_dispatch_{type(exc).__name__}"}
 
     def prepare_commit(self, ref: PullRequestRef, *, repository: str, branch: Optional[str],

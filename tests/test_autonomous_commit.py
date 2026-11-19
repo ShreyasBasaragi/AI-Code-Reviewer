@@ -4,10 +4,11 @@ from __future__ import annotations
 import hashlib
 import json
 import base64
+import time
 
 from fix_generation import FixCandidate
 from mcp_server.autonomous_fixes import AutonomousFixExecutor
-from mcp_server.behavioral_verification import BehavioralVerifier
+from mcp_server.behavioral_verification import BehavioralVerificationResult, BehavioralVerifier
 from mcp_server.github_action_coordinator import GitHubActionCoordinator
 from mcp_server.github_actions import GitHubMCPActionAdapter
 from mcp_server.github_policy import RepositoryActionConfig
@@ -65,13 +66,19 @@ class ReadClient:
         return {"full_name": f"{owner}/{repository}", "default_branch": "main",
                 "permissions": {"push": self.permissions}}
 
-    def get_ci_evidence(self, ref, sha, expected_workflow_identity=None):
+    def get_ci_evidence(self, ref, sha, expected_workflow_identity=None,
+                        *, workflow_run_branch=None, dispatched_after=None):
         status = self.ci
         actual_sha = sha if status != "sha_mismatch" else "b" * 40
         conclusion = "success" if status == "passed" else "failure" if status == "failed" else None
         check_status = "completed" if status in {"passed", "failed"} else "in_progress"
         return {"head_sha": actual_sha, "statuses": [], "workflow_runs": [{
+            "id": 71,
             "workflow_id": int(expected_workflow_identity or 7), "head_sha": actual_sha,
+            "head_branch": workflow_run_branch,
+            "display_title": f"CodeMentor candidate verification {sha}",
+            "candidate_sha": sha,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 10)),
             "event": "workflow_dispatch",
             "status": "completed" if status in {"passed", "failed"} else "in_progress",
             "conclusion": conclusion, "check_suite_id": 70,
@@ -122,7 +129,7 @@ class APITransport:
             self.read.after_staging = True
             return {"object": {"sha": CANDIDATE}}
         if "/actions/workflows/7/dispatches" in url and method == "POST":
-            assert payload.get("ref", "").startswith("codementor-candidates/")
+            assert payload.get("ref") == "main"
             assert payload.get("inputs", {}).get("candidate_sha") == CANDIDATE
             assert headers.get("Authorization") == "Bearer stage-only"
             return {}
@@ -158,6 +165,23 @@ class AttestedBroker:
     def verify_attestation(self, report, **kwargs):
         return (report.get("candidate_sha256") == kwargs["candidate_sha256"]
                 and report.get("test_identity") == "tests-style-contract-v1")
+
+
+class MockGitHubHostedVerifier:
+    def __init__(self, status="passed"):
+        self.status = status
+        self.arguments = None
+
+    def verify(self, **kwargs):
+        self.arguments = kwargs
+        return BehavioralVerificationResult(
+            self.status, "github_hosted_docker", hashlib.sha256(kwargs["original_source"]).hexdigest(),
+            hashlib.sha256(kwargs["candidate_source"]).hexdigest(), kwargs["changed_files"],
+            executed=True, exit_code=0 if self.status == "passed" else 1,
+            test_identity="1" * 64, verifier_id="github-actions:99",
+            attestation_verified=self.status == "passed",
+            candidate_commit_sha=kwargs["candidate_commit_sha"],
+        )
 
 
 class FakeFixProvider:
@@ -332,6 +356,63 @@ def test_candidate_staging_and_ci_work_without_final_commit_authorization(tmp_pa
     stored = store.get_actions("delivery-1")[0]
     assert stored["publication_status"] == "AUTONOMOUS_COMMIT_DISABLED"
     assert stored["verification_status"] == "passed"
+
+
+def test_github_hosted_attestation_stays_staging_only_without_prototype_policy(tmp_path):
+    coordinator, store, _adapter, transport, event, runtime = make_coordinator(tmp_path, commits=True)
+    executor = coordinator.autonomous_executor
+    hosted = MockGitHubHostedVerifier()
+    executor.behavioral_verifier = None
+    executor.github_behavioral_verifier = hosted
+    executor.github_hosted_commit_policy = ""
+    result = coordinator.process_review(event, review_payload(), runtime_files=runtime)
+    action = result["actions"][0]
+    assert action["status"] == "AUTONOMOUS_COMMIT_DISABLED"
+    assert action["reason"] == "github_hosted_prototype_policy_not_selected"
+    assert action["behavioral"]["isolation"] == "github_hosted_docker"
+    assert action["behavioral"]["candidate_commit_sha"] == CANDIDATE
+    assert hosted.arguments["source_workflow_run_id"] == 71
+    assert not any(method == "PATCH" for method, *_ in transport.calls)
+    assert store.get_actions("delivery-1")[0]["verification_status"] == "passed"
+
+
+def test_unknown_github_hosted_commit_policy_fails_closed(tmp_path):
+    coordinator, _store, _adapter, transport, event, runtime = make_coordinator(tmp_path, commits=True)
+    executor = coordinator.autonomous_executor
+    executor.behavioral_verifier = None
+    executor.github_behavioral_verifier = MockGitHubHostedVerifier()
+    executor.github_hosted_commit_policy = "future-policy"
+    result = coordinator.process_review(event, review_payload(), runtime_files=runtime)
+    assert result["actions"][0]["status"] == "AUTONOMOUS_COMMIT_DISABLED"
+    assert not any(method == "PATCH" for method, *_ in transport.calls)
+
+
+def test_github_hosted_prototype_policy_allows_gated_final_commit(tmp_path):
+    coordinator, store, _adapter, transport, event, runtime = make_coordinator(tmp_path, commits=True)
+    executor = coordinator.autonomous_executor
+    hosted = MockGitHubHostedVerifier()
+    executor.behavioral_verifier = None
+    executor.github_behavioral_verifier = hosted
+    executor.github_hosted_commit_policy = "prototype"
+    result = coordinator.process_review(event, review_payload(), runtime_files=runtime)
+    action = result["actions"][0]
+    assert action["status"] == "published"
+    assert action["commit_sha"] == CANDIDATE
+    assert action["behavioral"]["isolation"] == "github_hosted_docker"
+    assert hosted.arguments["source_workflow_run_id"] == 71
+    assert sum(method == "PATCH" for method, *_ in transport.calls) == 1
+    assert store.get_actions("delivery-1")[0]["publication_status"] == "published"
+
+
+def test_failed_github_hosted_attestation_blocks_candidate_finalization(tmp_path):
+    coordinator, _store, _adapter, transport, event, runtime = make_coordinator(tmp_path, commits=True)
+    executor = coordinator.autonomous_executor
+    executor.behavioral_verifier = None
+    executor.github_behavioral_verifier = MockGitHubHostedVerifier(status="failed")
+    result = coordinator.process_review(event, review_payload(), runtime_files=runtime)
+    assert result["actions"][0]["status"] == "blocked"
+    assert result["actions"][0]["reason"] == "github_hosted_behavioral_verification_not_attested"
+    assert not any(method == "PATCH" for method, *_ in transport.calls)
 
 
 def test_invalid_or_untyped_evidence_ids_block_candidate_staging(tmp_path):

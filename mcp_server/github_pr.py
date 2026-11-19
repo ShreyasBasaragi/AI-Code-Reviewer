@@ -13,6 +13,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+import io
+from datetime import datetime, timezone
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
@@ -32,6 +35,16 @@ API_VERSION = "2022-11-28"
 _PR_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/pull/([1-9][0-9]*)/?$")
 _REPO_PART = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 _HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def _workflow_run_after(value: Any, timestamp: float) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc).timestamp() >= timestamp
+    except (ValueError, OverflowError):
+        return False
 
 
 class GitHubPRException(Exception):
@@ -236,10 +249,62 @@ class GitHubRESTClient:
         return payload
 
     def get_ci_evidence(self, ref: PullRequestRef, commit_sha: str,
-                        expected_workflow_identity: Optional[str] = None) -> dict[str, Any]:
+                        expected_workflow_identity: Optional[str] = None,
+                        *, workflow_run_branch: Optional[str] = None,
+                        dispatched_after: Optional[float] = None) -> dict[str, Any]:
         """Read checks and bind Actions checks to a successful exact-SHA workflow run."""
         if not isinstance(commit_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", commit_sha):
             raise GitHubPRException("invalid_commit_sha", 422, "A full commit SHA is required for CI verification.")
+        if expected_workflow_identity is not None and workflow_run_branch is not None:
+            if not re.fullmatch(r"[0-9]{1,20}", expected_workflow_identity):
+                raise GitHubPRException("github_workflow_identity_invalid", 422,
+                                        "A numeric GitHub workflow ID is required.")
+            workflow_payload, _ = self._get(
+                f"{self._repo_path(ref)}/actions/workflows/{expected_workflow_identity}/runs",
+                {"branch": workflow_run_branch, "event": "workflow_dispatch", "per_page": "100"},
+            )
+            runs = workflow_payload.get("workflow_runs") if isinstance(workflow_payload, dict) else None
+            if not isinstance(runs, list) or len(runs) >= 100:
+                raise GitHubPRException("github_workflow_runs_invalid", 502,
+                                        "GitHub returned ambiguous workflow-run data.")
+            exact_runs = [item for item in runs if isinstance(item, dict)
+                          and item.get("workflow_id") == int(expected_workflow_identity)
+                          and item.get("event") == "workflow_dispatch"
+                          and item.get("head_branch") == workflow_run_branch
+                          and item.get("display_title") == f"CodeMentor candidate verification {commit_sha}"
+                          and (dispatched_after is None or _workflow_run_after(item.get("created_at"), dispatched_after))]
+            if len(exact_runs) != 1:
+                return {"head_sha": commit_sha, "check_runs": [], "statuses": [], "workflow_runs": []}
+            run = exact_runs[0]
+            run_id = run.get("id")
+            workflow_head_sha = run.get("head_sha")
+            suite_id = run.get("check_suite_id")
+            if (isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0
+                    or not isinstance(workflow_head_sha, str)
+                    or not re.fullmatch(r"[0-9a-fA-F]{40,64}", workflow_head_sha)
+                    or isinstance(suite_id, bool) or not isinstance(suite_id, int)):
+                raise GitHubPRException("github_workflow_run_identity_invalid", 502,
+                                        "GitHub returned an invalid candidate workflow run.")
+            check_payload, _ = self._get(
+                f"{self._repo_path(ref)}/commits/{urllib.parse.quote(workflow_head_sha, safe='')}/check-runs",
+                {"per_page": "100"},
+            )
+            rows = check_payload.get("check_runs") if isinstance(check_payload, dict) else None
+            if (not isinstance(rows, list) or len(rows) >= 100
+                    or check_payload.get("sha") != workflow_head_sha):
+                raise GitHubPRException("github_ci_response_invalid", 502,
+                                        "GitHub returned incomplete workflow check data.")
+            checks = []
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                suite = item.get("check_suite") if isinstance(item.get("check_suite"), dict) else {}
+                if suite.get("id") == suite_id:
+                    checks.append({**item, "head_sha": commit_sha,
+                                   "workflow_identity": expected_workflow_identity})
+            attested_run = {**run, "candidate_sha": commit_sha, "head_sha": commit_sha}
+            return {"head_sha": commit_sha, "check_runs": checks,
+                    "statuses": [], "workflow_runs": [attested_run]}
         encoded = urllib.parse.quote(commit_sha, safe="")
         check_payload, _ = self._get(f"{self._repo_path(ref)}/commits/{encoded}/check-runs",
                                      {"per_page": "100"})
@@ -266,6 +331,8 @@ class GitHubRESTClient:
                 and item.get("workflow_id") == int(expected_workflow_identity)
                 and item.get("head_sha") == commit_sha
                 and item.get("event") == "workflow_dispatch"
+                and (workflow_run_branch is None or item.get("head_branch") == workflow_run_branch)
+                and (dispatched_after is None or _workflow_run_after(item.get("created_at"), dispatched_after))
                 and item.get("status") == "completed"
                 and item.get("conclusion") == "success"
                 and isinstance(item.get("check_suite_id"), int)
@@ -275,10 +342,133 @@ class GitHubRESTClient:
                 suite_id = suite.get("id") if isinstance(suite, dict) else None
                 if suite_id in successful_suite_ids:
                     check_run["workflow_identity"] = expected_workflow_identity
+            exact_runs = [item for item in runs if isinstance(item, dict)
+                          and item.get("workflow_id") == int(expected_workflow_identity)
+                          and item.get("head_sha") == commit_sha
+                          and item.get("event") == "workflow_dispatch"
+                          and (workflow_run_branch is None or item.get("head_branch") == workflow_run_branch)
+                          and (dispatched_after is None or _workflow_run_after(item.get("created_at"), dispatched_after))]
+        else:
+            exact_runs = []
         return {"head_sha": check_payload.get("sha"),
                 "check_runs": check_runs,
+                "workflow_runs": exact_runs,
                 "statuses": [dict(item, sha=commit_sha) for item in status_payload["statuses"]
                              if isinstance(item, dict)]}
+
+    def get_behavioral_attestation(self, *, owner: str, repository: str,
+                                   source_workflow_id: str, source_workflow_run_id: int,
+                                   candidate_commit_sha: str, attestation_workflow_id: str) -> dict[str, Any]:
+        """Fetch the one signed artifact linked to an exact source workflow run."""
+        if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", owner or "")
+                or not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", repository or "")
+                or not re.fullmatch(r"[0-9]{1,20}", source_workflow_id or "")
+                or not re.fullmatch(r"[0-9]{1,20}", attestation_workflow_id or "")
+                or isinstance(source_workflow_run_id, bool) or not isinstance(source_workflow_run_id, int)
+                or source_workflow_run_id <= 0
+                or not re.fullmatch(r"[0-9a-fA-F]{40,64}", candidate_commit_sha or "")):
+            raise GitHubPRException("github_behavioral_identity_invalid", 422,
+                                    "Behavioral verification identity is invalid.")
+        repo_path = f"/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repository, safe='')}"
+        runs_payload, _ = self._get(
+            f"{repo_path}/actions/workflows/{attestation_workflow_id}/runs",
+            {"event": "workflow_run", "per_page": "100"},
+        )
+        runs = runs_payload.get("workflow_runs") if isinstance(runs_payload, dict) else None
+        if not isinstance(runs, list) or len(runs) >= 100:
+            raise GitHubPRException("github_behavioral_runs_ambiguous", 502,
+                                    "Behavioral attestation runs are missing or ambiguous.")
+        expected_title = f"CodeMentor behavioral attestation source-run-{source_workflow_run_id}"
+        matching = [row for row in runs if isinstance(row, dict)
+                    and row.get("workflow_id") == int(attestation_workflow_id)
+                    and row.get("event") == "workflow_run"
+                    and row.get("display_title") == expected_title
+                    and row.get("status") == "completed"
+                    and row.get("conclusion") == "success"]
+        if len(matching) != 1:
+            raise GitHubPRException("github_behavioral_run_missing_or_ambiguous", 502,
+                                    "Behavioral attestation run is missing or ambiguous.")
+        run = matching[0]
+        run_id = run.get("id")
+        repository_metadata = self.get_repository(owner, repository)
+        if (isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0
+                or run.get("head_branch") != repository_metadata.get("default_branch")):
+            raise GitHubPRException("github_behavioral_run_identity_invalid", 502,
+                                    "Behavioral attestation run identity is invalid.")
+        artifacts_payload, _ = self._get(f"{repo_path}/actions/runs/{run_id}/artifacts", {"per_page": "100"})
+        artifacts = artifacts_payload.get("artifacts") if isinstance(artifacts_payload, dict) else None
+        if isinstance(artifacts, list) and len(artifacts) >= 100:
+            raise GitHubPRException("github_behavioral_artifact_ambiguous", 502,
+                                    "Behavioral evidence artifacts are ambiguous.")
+        artifact_name = f"codementor-behavioral-{source_workflow_run_id}"
+        matches = [row for row in artifacts if isinstance(row, dict)
+                   and row.get("name") == artifact_name and row.get("expired") is False] if isinstance(artifacts, list) else []
+        if len(matches) != 1:
+            raise GitHubPRException("github_behavioral_artifact_missing_or_ambiguous", 502,
+                                    "Behavioral evidence artifact is missing or ambiguous.")
+        artifact_id = matches[0].get("id")
+        if isinstance(artifact_id, bool) or not isinstance(artifact_id, int) or artifact_id <= 0:
+            raise GitHubPRException("github_behavioral_artifact_identity_invalid", 502,
+                                    "Behavioral evidence artifact identity is invalid.")
+        raw = self._download_artifact(f"{repo_path}/actions/artifacts/{artifact_id}/zip")
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                names = archive.namelist()
+                if names != ["attestation.json"]:
+                    raise ValueError("artifact_contents_invalid")
+                info = archive.getinfo("attestation.json")
+                if info.file_size > 64 * 1024:
+                    raise ValueError("artifact_oversized")
+                value = json.loads(archive.read(info).decode("utf-8"))
+        except (ValueError, OSError, zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GitHubPRException("github_behavioral_artifact_invalid", 502,
+                                    "Behavioral evidence artifact is invalid.") from exc
+        if not isinstance(value, dict):
+            raise GitHubPRException("github_behavioral_artifact_invalid", 502,
+                                    "Behavioral evidence artifact is invalid.")
+        # Bind the detached artifact to the unique signer run found above.
+        value["attestation_run_id"] = run_id
+        return value
+
+    def _download_artifact(self, path: str) -> bytes:
+        """Follow only GitHub's signed object-storage redirect, without auth."""
+        if not path.startswith("/") or ".." in path.split("/"):
+            raise GitHubPRException("invalid_api_path", 500, "The GitHub API request could not be constructed safely.")
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "AI-Code-Reviewer-ReadOnly",
+                   "X-GitHub-Api-Version": API_VERSION}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        try:
+            self.opener.open(urllib.request.Request(API_BASE + path, headers=headers), timeout=self.timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {301, 302, 303, 307, 308}:
+                raise GitHubPRException("github_artifact_download_failed", 502,
+                                        "GitHub could not provide the behavioral evidence artifact.") from exc
+            location = exc.headers.get("Location") if exc.headers else None
+            exc.close()
+        except Exception as exc:
+            raise GitHubPRException("github_artifact_download_failed", 502,
+                                    "GitHub could not provide the behavioral evidence artifact.") from exc
+        else:
+            raise GitHubPRException("github_artifact_redirect_missing", 502,
+                                    "GitHub did not provide the expected artifact redirect.")
+        try:
+            parsed = urllib.parse.urlsplit(location or "")
+            host = (parsed.hostname or "").lower()
+            allowed = (host.endswith(".blob.core.windows.net") or host.endswith(".amazonaws.com"))
+            if (parsed.scheme != "https" or not allowed or parsed.username or parsed.password
+                    or parsed.fragment or parsed.port not in (None, 443)):
+                raise ValueError("artifact_redirect_host_invalid")
+            # Use a fresh request with no GitHub Authorization header and don't follow further redirects.
+            request = urllib.request.Request(location, headers={"User-Agent": "AI-Code-Reviewer-Artifact"})
+            with self.opener.open(request, timeout=self.timeout) as response:
+                raw = response.read(128 * 1024 + 1)
+                if len(raw) > 128 * 1024:
+                    raise ValueError("artifact_oversized")
+                return raw
+        except Exception as exc:
+            raise GitHubPRException("github_artifact_download_failed", 502,
+                                    "Behavioral evidence artifact could not be safely downloaded.") from exc
 
     def list_directory(self, ref: PullRequestRef, path: str, commit_sha: str,
                        *, max_entries: int = 100) -> tuple[list[dict[str, Any]], bool]:

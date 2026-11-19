@@ -370,7 +370,9 @@ def create_app(service: Optional[ReviewFixService] = None,
         read_client=getattr(getattr(lifecycle, "github_pr_service", None), "client", None),
     )
     from mcp_server.autonomous_fixes import AutonomousFixExecutor
-    from mcp_server.behavioral_verification import BehavioralVerifier, RemoteHTTPSExecutionBroker
+    from mcp_server.behavioral_verification import (
+        BehavioralVerifier, GitHubActionsBehavioralVerifier, RemoteHTTPSExecutionBroker,
+    )
 
     def _confidence_for_finding(finding):
         from mcp_server.confidence import load_runtime_confidence
@@ -407,11 +409,49 @@ def create_app(service: Optional[ReviewFixService] = None,
     broker = (RemoteHTTPSExecutionBroker()
               if os.getenv("AI_CODE_REVIEWER_SANDBOX_URL") and os.getenv("AI_CODE_REVIEWER_SANDBOX_HMAC_KEY")
               else None)
+    github_attestation_workflow = os.getenv("GITHUB_BEHAVIORAL_ATTESTATION_WORKFLOW_ID", "")
+    github_bundle_identity = os.getenv("GITHUB_BEHAVIORAL_TEST_BUNDLE_SHA256", "")
+    github_hmac_key = os.getenv("GITHUB_BEHAVIORAL_ATTESTATION_HMAC_KEY", "")
+    github_candidate_workflow = os.getenv("GITHUB_CANDIDATE_WORKFLOW_ID", "")
+    provider_choice = os.getenv("GITHUB_BEHAVIORAL_VERIFICATION_PROVIDER", "").strip().casefold()
+    github_configured = bool(github_attestation_workflow and github_bundle_identity and github_hmac_key
+                             and github_candidate_workflow)
+    remote_configured = broker is not None
+    selected_provider = provider_choice or (
+        "github_actions" if github_configured and not remote_configured else
+        "remote_https" if remote_configured and not github_configured else "")
+    github_verifier = None
+    if selected_provider == "github_actions" and github_configured:
+        def _fetch_behavioral_attestation(**kwargs):
+            client = getattr(action_coordinator.adapter, "read_client", None)
+            fetch_attestation = getattr(client, "get_behavioral_attestation", None)
+            if not callable(fetch_attestation):
+                raise RuntimeError("github_behavioral_attestation_reader_unavailable")
+            owner_name, separator, repository_name = str(kwargs.get("repository", "")).partition("/")
+            if not separator or not owner_name or not repository_name:
+                raise ValueError("github_behavioral_repository_identity_invalid")
+            return fetch_attestation(
+                owner=owner_name, repository=repository_name,
+                source_workflow_id=kwargs["source_workflow_id"],
+                source_workflow_run_id=kwargs["source_workflow_run_id"],
+                candidate_commit_sha=kwargs["candidate_commit_sha"],
+                attestation_workflow_id=kwargs["attestation_workflow_id"],
+            )
+        github_verifier = GitHubActionsBehavioralVerifier(
+            _fetch_behavioral_attestation,
+            key=github_hmac_key,
+            expected_test_identity=github_bundle_identity,
+            attestation_workflow_id=github_attestation_workflow,
+        )
+    remote_verifier = (BehavioralVerifier(broker)
+                       if selected_provider == "remote_https" and remote_configured else None)
     action_coordinator.autonomous_executor = AutonomousFixExecutor(
         store=delivery_store, adapter=action_coordinator.adapter,
         fix_generator=_generate_autonomous_fix,
         confidence_resolver=_confidence_for_finding,
-        behavioral_verifier=BehavioralVerifier(broker) if broker else None,
+        behavioral_verifier=remote_verifier,
+        github_behavioral_verifier=github_verifier,
+        github_hosted_commit_policy=os.getenv("GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY", ""),
         behavioral_tests=_behavioral_tests,
     )
 
@@ -948,14 +988,37 @@ def create_app(service: Optional[ReviewFixService] = None,
         executor = getattr(action_coordinator, "autonomous_executor", None)
         staging_ready = bool(adapter and adapter.staging_enabled and adapter.staging_token)
         commit_ready = bool(adapter and adapter.commit_enabled and adapter.commit_token)
-        behavioral_ready = bool(executor and executor.behavioral_verifier and executor.behavioral_tests)
+        has_remote = bool(executor and executor.behavioral_verifier and executor.behavioral_tests)
+        has_github_hosted = bool(executor and executor.github_behavioral_verifier)
+        behavioral_ready = has_remote ^ has_github_hosted
         workflow_ready = bool(executor and executor.workflow_identity)
         calibration_ready = bool(os.getenv("AI_CODE_REVIEWER_RUNTIME_CALIBRATION_PATH")
                                 and os.getenv("AI_CODE_REVIEWER_CALIBRATION_DATASET_ID"))
+        if has_github_hosted:
+            hosted_policy = getattr(executor, "github_hosted_commit_policy", "")
+            behavioral_commit_scope = (
+                "github_hosted_prototype_policy_selected" if hosted_policy == "prototype" else
+                "candidate_staging_only_github_hosted_docker_boundary"
+            )
+        elif has_remote:
+            behavioral_commit_scope = "existing_independent_commit_gates"
+        else:
+            behavioral_commit_scope = "unavailable"
         return {
             "syntax": "available_ast_parse_only",
             "static": "available_deterministic_ast_rules",
-            "behavioral": "configured_remote_attested_broker" if behavioral_ready else "not_run_isolated_execution_broker_unavailable",
+            "behavioral": ("configured_remote_gvisor_or_compatible_broker" if has_remote else
+                           "configured_github_hosted_attested_workflow" if has_github_hosted else
+                           "not_run_isolated_execution_broker_unavailable"
+                           if not remote_configured and not github_configured and not provider_choice else
+                           "provider_configuration_ambiguous_or_unavailable"),
+            "behavioral_provider": "remote_https" if has_remote else "github_actions" if has_github_hosted else "none",
+            "behavioral_commit_scope": behavioral_commit_scope,
+            "github_hosted_commit_policy": (
+                "prototype_selected" if has_github_hosted
+                and getattr(executor, "github_hosted_commit_policy", "") == "prototype"
+                else "disabled_or_unavailable"
+            ),
             "github_ci": "read_only_exact_sha_verification_available",
             "candidate_revision_ci": "configured_workflow_and_checks_required" if workflow_ready else "requires_candidate_revision_and_workflow_identity",
             "confidence_calibration": "artifact_configured_validation_occurs_per_finding" if calibration_ready else "unavailable_without_signed_independent_labels",

@@ -6,8 +6,10 @@ The current implementation can stage a candidate revision, verify it, and
 advance the pull request branch through a narrow non-force GitHub ref update.
 This path is disabled by default and fails closed unless repository policy,
 separate staging and final-write credentials, signed confidence evidence,
-an attested remote behavioral verifier, candidate-specific CI, source/diff
-checks, and all runtime gates pass. Configure the independent write switches
+an attested behavioral verifier, candidate-specific CI, source/diff checks,
+and all runtime gates pass. GitHub-hosted verification can authorize the final
+adapter only under `GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY=prototype`; this
+accepts a weaker Docker-on-hosted-VM boundary than gVisor. Configure the independent write switches
 `GITHUB_CANDIDATE_STAGING_ENABLED` and `GITHUB_AUTONOMOUS_COMMIT_ENABLED` only
 after reviewing the deployment. Tokens can be stored separately as
 `github_candidate_staging_token` and `github_autonomous_commit_token`; the
@@ -27,6 +29,15 @@ that candidate branch and polls exact-SHA check/status evidence for at most 60
 seconds by default (bounded to 180 seconds). Set
 `GITHUB_CANDIDATE_CI_WAIT_SECONDS` to tune that bounded wait; pending or missing
 checks at the deadline block finalization.
+
+For GitHub-hosted verification, the API also requires
+`GITHUB_BEHAVIORAL_VERIFICATION_PROVIDER=github_actions`,
+`GITHUB_BEHAVIORAL_ATTESTATION_HMAC_KEY`,
+`GITHUB_BEHAVIORAL_ATTESTATION_WORKFLOW_ID`,
+`GITHUB_BEHAVIORAL_TEST_BUNDLE_SHA256`, and
+`GITHUB_CANDIDATE_WORKFLOW_ID`. The trusted workflows must be installed on the
+default branch, and repository variables/secrets must match these values.
+Leave `GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY` unset for staging-only behavior.
 
 `GET /api/verification/capabilities` reports configuration presence without
 performing external checks; it does not prove a credential can write, a remote

@@ -1,0 +1,148 @@
+name: CodeMentor behavioral attestation
+run-name: CodeMentor behavioral attestation source-run-${{ github.event.workflow_run.id }}
+
+on:
+  workflow_run:
+    workflows: ["Candidate verification"]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  verify-candidate:
+    if: >-
+      github.event.workflow_run.workflow_id == vars.CODEMENTOR_CANDIDATE_WORKFLOW_ID &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      candidate_sha: ${{ steps.prepare.outputs.candidate_sha }}
+      parent_sha: ${{ steps.prepare.outputs.parent_sha }}
+      changed_file: ${{ steps.prepare.outputs.changed_file }}
+      source_sha256: ${{ steps.prepare.outputs.source_sha256 }}
+      test_identity: ${{ steps.bundle.outputs.test_identity }}
+      status: ${{ steps.execute.outputs.status }}
+      exit_code: ${{ steps.execute.outputs.exit_code }}
+      duration_seconds: ${{ steps.execute.outputs.duration_seconds }}
+    steps:
+      - name: Check out trusted default-branch verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          path: trusted
+      - name: Extract candidate SHA from trusted dispatch title
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          SOURCE_RUN_TITLE="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" --jq '.display_title')"
+          candidate_sha="${SOURCE_RUN_TITLE#CodeMentor candidate verification }"
+          echo "$candidate_sha" | grep -Eq '^[a-f0-9]{40,64}$'
+          echo "candidate_sha=$candidate_sha" >> "$GITHUB_OUTPUT"
+      - name: Check out exact candidate commit without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ steps.candidate.outputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: candidate
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Verify pinned trusted test bundle identity
+        id: bundle
+        env:
+          EXPECTED_BUNDLE: ${{ vars.CODEMENTOR_BEHAVIORAL_TEST_BUNDLE_SHA256 }}
+        run: |
+          actual="$(python trusted/deploy/behavioral_executor/bundle_identity.py)"
+          test -n "$EXPECTED_BUNDLE"
+          test "$actual" = "$EXPECTED_BUNDLE"
+          echo "test_identity=$actual" >> "$GITHUB_OUTPUT"
+      - name: Prepare exact candidate source request
+        id: prepare
+        env:
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
+        run: python trusted/deploy/behavioral_executor/make_request.py candidate "$CANDIDATE_SHA" /tmp/codementor-request.json
+      - name: Build trusted runner image
+        env:
+          PYTHON_BASE_IMAGE: ${{ vars.CODEMENTOR_VERIFIER_PYTHON_BASE_IMAGE }}
+        run: |
+          echo "$PYTHON_BASE_IMAGE" | grep -Eq '^python:3\.11-slim@sha256:[a-f0-9]{64}$'
+          docker build --build-arg PYTHON_BASE_IMAGE="$PYTHON_BASE_IMAGE" \
+            -f trusted/deploy/behavioral_executor/Dockerfile -t codementor-verifier:trusted trusted
+      - name: Execute trusted tests with disposable hosted-runner container
+        id: execute
+        run: |
+          started="$(date +%s)"
+          set +e
+          runner_output="$(docker run --rm --network=none --read-only --cap-drop=ALL \
+            --security-opt=no-new-privileges --user=65532:65532 --pids-limit=64 \
+            --memory=2g --memory-swap=2g --cpus=1 --ulimit cpu=180:181 \
+            --tmpfs /tmp:rw,nosuid,nodev,noexec,size=256m \
+            -v /tmp/codementor-request.json:/input/request.json:ro \
+            --log-driver=none codementor-verifier:trusted \
+            python -I /opt/runner/runner.py /input/request.json 2>/dev/null)"
+          result=$?
+          set -e
+          ended="$(date +%s)"
+          duration=$((ended - started))
+          status=errored
+          if [ "$result" -eq 124 ] && echo "$runner_output" | grep -q '^CODEMENTOR_STATUS:timeout$'; then status=timeout; fi
+          if [ "$result" -eq 0 ] && echo "$runner_output" | grep -q '^CODEMENTOR_STATUS:passed$'; then status=passed; fi
+          if [ "$result" -ne 0 ] && [ "$result" -ne 124 ] && echo "$runner_output" | grep -q '^CODEMENTOR_STATUS:failed$'; then status=failed; fi
+          {
+            echo "status=$status"
+            echo "exit_code=$result"
+            echo "duration_seconds=$duration"
+          } >> "$GITHUB_OUTPUT"
+
+  sign-result:
+    if: always() && needs.verify-candidate.result == 'success'
+    needs: verify-candidate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out trusted attestation signer
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate and sign the exact behavioral result
+        env:
+          CODEMENTOR_BEHAVIORAL_ATTESTATION_HMAC_KEY: ${{ secrets.CODEMENTOR_BEHAVIORAL_ATTESTATION_HMAC_KEY }}
+          GITHUB_OUTPUT_FILE: ${{ runner.temp }}/attestation.json
+          ATTEST_REPOSITORY: ${{ github.repository }}
+          ATTEST_SOURCE_WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          ATTEST_SOURCE_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEST_CANDIDATE_SHA: ${{ needs.verify-candidate.outputs.candidate_sha }}
+          ATTEST_PARENT_SHA: ${{ needs.verify-candidate.outputs.parent_sha }}
+          ATTEST_CHANGED_FILE: ${{ needs.verify-candidate.outputs.changed_file }}
+          ATTEST_SOURCE_SHA256: ${{ needs.verify-candidate.outputs.source_sha256 }}
+          ATTEST_TEST_IDENTITY: ${{ needs.verify-candidate.outputs.test_identity }}
+          ATTEST_STATUS: ${{ needs.verify-candidate.outputs.status }}
+          ATTEST_EXIT_CODE: ${{ needs.verify-candidate.outputs.exit_code }}
+          ATTEST_DURATION_SECONDS: ${{ needs.verify-candidate.outputs.duration_seconds }}
+          ATTEST_ATTESTATION_WORKFLOW_ID: ${{ vars.CODEMENTOR_BEHAVIORAL_ATTESTATION_WORKFLOW_ID }}
+          ATTEST_ATTESTATION_RUN_ID: ${{ github.run_id }}
+        run: |
+          test "$ATTEST_SOURCE_WORKFLOW_ID" = "${{ vars.CODEMENTOR_CANDIDATE_WORKFLOW_ID }}"
+          test -n "$ATTEST_ATTESTATION_WORKFLOW_ID"
+          test "$ATTEST_TEST_IDENTITY" = "${{ vars.CODEMENTOR_BEHAVIORAL_TEST_BUNDLE_SHA256 }}"
+          python deploy/behavioral_executor/sign_attestation.py
+      - name: Upload one uniquely named signed result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codementor-behavioral-${{ github.event.workflow_run.id }}
+          path: ${{ runner.temp }}/attestation.json
+          if-no-files-found: error
+          retention-days: 1

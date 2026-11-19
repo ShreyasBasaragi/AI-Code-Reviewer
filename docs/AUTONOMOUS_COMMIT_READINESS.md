@@ -1,144 +1,222 @@
 # Autonomous candidate verification readiness
 
-## Implementation state
+## Verification modes
 
-The project already had a fail-closed behavioral-verification client, HMAC
-attestation validation, candidate branch staging, workflow dispatch, exact-SHA
-check retrieval, independent confidence artifacts, repository policy, duplicate
-action suppression, and a final non-force ref update behind separate
-authorization. The executor previously had no deployable server/runtime, and
-the autonomous executor rejected tuple-shaped LLM evidence IDs even though the
-review pipeline accepts both lists and tuples.
+CodeMentor supports two mutually exclusive behavioral-verification modes for
+an operation:
 
-This change adds:
+- `remote_https`: the existing separately deployed signed executor. Keep the
+  gVisor deployment under `deploy/behavioral_executor/` as an optional
+  deployment path.
+- `github_actions`: a trusted default-branch `workflow_run` verifier runs the
+  pinned project test bundle against the exact staged candidate SHA and signs
+  a bounded result artifact. It supports staging and human review by default.
+  A separate explicit `prototype` policy can also let a fully gated candidate
+  reach the existing final-commit adapter.
 
-- A separately hosted HTTPS broker in `deploy/behavioral_executor/service.py`.
-  It authenticates fresh HMAC-signed bounded requests, binds the candidate
-  digest and test bundle identity, and signs the existing attestation format.
-- A runner image definition and test launcher. Candidate code runs only in a
-  disposable `runsc` container with no network, no credentials, read-only root
-  and input filesystems, bounded memory, one CPU quota, CPU and wall limits,
-  process-count limits, temporary storage, and forced cleanup. No fallback to
-  local subprocess execution exists.
-- A dedicated `workflow_dispatch` candidate workflow. It checks out and
-  verifies the exact candidate SHA, reports stable checks named
-  `candidate-syntax`, `candidate-static`, and `candidate-regression`, and has
-  only `contents: read`. Checkout does not persist credentials, no secrets are
-  passed, and staging/final-commit flags are false in the regression job.
-- Exact candidate SHA as a required workflow input, checked against the event
-  SHA and checked-out revision.
-- Independent candidate staging and verification: when final commit is
-  disabled or its separate token is absent, a passing candidate remains
-  staged and verified for human review, and no final ref update is attempted.
-- Tuple/list evidence compatibility with strict evidence-ID type and
-  membership validation.
+The GitHub-hosted mode is **not a gVisor equivalent**. Candidate tests run in a
+disposable Docker container on an ephemeral GitHub-hosted Linux VM, with no
+network, credentials, writable root, added capabilities, or host mounts, plus
+CPU, memory, process and time limits. The container shares the VM kernel, so a
+container escape could compromise that job's ephemeral VM. GitHub-hosted runner
+ephemerality limits persistence across jobs but does not establish a separate
+kernel boundary. This prototype policy therefore has a weaker execution trust
+boundary than the optional gVisor deployment. It is disabled unless
+`GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY=prototype` is explicitly selected, and
+still requires every repository, confidence, evidence, source identity, change
+size, verification, CI, credential, branch, freshness, idempotency and durable
+record gate described below. Unknown policy values fail closed. Use the
+separately reviewed stronger verifier where a separate kernel boundary is
+required.
 
-No application setting, repository opt-in, token, or GitHub write switch was
-enabled. No live GitHub or model requests were made.
+Neither mode runs candidate code in the API process. The verifier refuses
+missing, expired, stale, ambiguous, unsigned, failed, timed-out or mismatched
+evidence. Ordinary green workflow checks are not behavioral attestations.
 
-## External prerequisites and current blockers
+## GitHub-hosted workflow setup
 
-Controlled staging is **not ready to enable yet**. The implementation can be
-tested offline, but no isolated executor has been deployed or tested on a
-dedicated Linux host. The current environment does not establish that gVisor
-`runsc` is installed, configured, or effective. The runner image has not been
-built, reviewed, digest-pinned, or deployed. The dedicated host, TLS certificate,
-HMAC secret, and owner-provided ZIP test bundle must be provisioned and tested
-before staging is enabled.
+Install both workflow files on the repository's default branch:
 
-macOS development is limited to protocol/unit tests with Docker calls mocked.
-Do not run this executor against Docker Desktop or a developer machine. The
-`runsc` isolation and resource enforcement claims require the external Linux
-deployment procedure in [`../deploy/behavioral_executor/README.md`](../deploy/behavioral_executor/README.md).
+- `.github/workflows/candidate-verification.yml` — dispatched on the protected
+  default branch, with the candidate SHA as an input. The trusted workflow
+  checks out that exact commit separately and reports the named candidate CI
+  checks. The candidate branch's copy of workflow files is never executed.
+- `.github/workflows/behavioral-attestation.yml` — triggered by completion of
+  the candidate workflow. Its verification job checks out trusted test code
+  from the default branch and the exact candidate commit separately. Candidate
+  source is passed as data to the container. Only the signer job receives the
+  HMAC secret; that job does not check out or execute candidate code.
 
-## Runtime configuration
+The behavioral test bundle is maintained on the default branch in
+`tests/`, `dataset_pipeline/tests/`, and `rag/tests/`. Candidate-provided tests
+are not used. The identity includes those files plus Python requirements,
+pytest configuration, and the trusted runner image definition and launcher.
+After merging/releasing the trusted workflow and test bundle, compute the
+identity from that exact default-branch revision:
 
-API-side environment variables:
+```sh
+python deploy/behavioral_executor/bundle_identity.py
+```
 
-- `AI_CODE_REVIEWER_SANDBOX_URL` — HTTPS URL ending in `/v1/execute`.
-- `AI_CODE_REVIEWER_SANDBOX_HMAC_KEY` — same secret as the executor-side
-  `AI_CODE_REVIEWER_EXECUTOR_HMAC_KEY`; never place its value in logs or docs.
-- `AI_CODE_REVIEWER_BEHAVIORAL_TEST_BUNDLE` — owner-controlled, owner-only ZIP
-  file with Python test files below `tests/`.
-- `AI_CODE_REVIEWER_RUNTIME_CALIBRATION_PATH`,
-  `AI_CODE_REVIEWER_CALIBRATION_DATASET_ID`, and
-  `AI_CODE_REVIEWER_CALIBRATION_VERIFY_KEY` — required independent signed
-  calibration. The existing category and confidence bounds remain in force.
-- `GITHUB_CANDIDATE_WORKFLOW_ID` — numeric ID of the dedicated workflow.
-- `GITHUB_CANDIDATE_CI_WAIT_SECONDS` — existing bounded wait; pending or absent
-  checks remain blocked.
-- `GITHUB_CANDIDATE_STAGING_TOKEN` and
-  `GITHUB_AUTONOMOUS_COMMIT_TOKEN` — separate credentials, when needed.
-- `GITHUB_CANDIDATE_STAGING_ENABLED` and
-  `GITHUB_AUTONOMOUS_COMMIT_ENABLED` — both remain `false` by default. Staging
-  may later be enabled independently; final commit remains separately disabled.
-- `GITHUB_ACTION_POLICY_PATH` — administrator-owned repository opt-in and
-  permitted-branch configuration. No repository policy was changed.
+Configure repository variables:
 
-Executor-side settings are listed in
-[`../deploy/behavioral_executor/executor.env.example`](../deploy/behavioral_executor/executor.env.example):
-TLS certificate/key paths, HMAC key, immutable runner-image digest, bind/port,
-concurrency, and private temporary directory. The executor host must not hold
-GitHub, Groq, model, or API credentials.
+- `CODEMENTOR_CANDIDATE_WORKFLOW_ID` — numeric workflow ID for
+  `candidate-verification.yml`.
+- `CODEMENTOR_BEHAVIORAL_ATTESTATION_WORKFLOW_ID` — numeric workflow ID for
+  `behavioral-attestation.yml`.
+- `CODEMENTOR_BEHAVIORAL_TEST_BUNDLE_SHA256` — output of the command above.
+- `CODEMENTOR_VERIFIER_PYTHON_BASE_IMAGE` — a reviewed, digest-pinned
+  `python:3.11-slim@sha256:<64 lowercase hex>` image reference.
 
-GitHub credentials must remain least-privilege and separate. The staging
-credential needs `Contents: write` to create a candidate revision and
-`Actions: write` to dispatch the workflow. The final-commit credential needs
-`Contents: write` and remains unused while final commits are disabled. The
-read/check client needs only repository content/check/workflow read access. The
-workflow's `GITHUB_TOKEN` is limited to `contents: read`; do not add secrets,
-write permissions, or credential persistence to candidate jobs.
+After the two workflows are on the default branch, obtain their IDs and set
+the public variables with the GitHub CLI (replace the two workflow IDs and
+image digest with reviewed values):
 
-Install `.github/workflows/candidate-verification.yml` on the repository's
-default branch first, then record its numeric workflow ID. Configure the
-repository's `required_github_checks` to exactly the three stable job names
-above. Existing checks must be completed successfully, belong to that workflow
-identity, and match the exact candidate SHA. Missing, pending, stale, skipped,
-cancelled, neutral, failed, or wrong-workflow checks continue to block final
-commit.
+```sh
+gh workflow list --all --json id,name,path
+gh variable set CODEMENTOR_CANDIDATE_WORKFLOW_ID --body '<candidate workflow ID>'
+gh variable set CODEMENTOR_BEHAVIORAL_ATTESTATION_WORKFLOW_ID --body '<attestation workflow ID>'
+gh variable set CODEMENTOR_BEHAVIORAL_TEST_BUNDLE_SHA256 \
+  --body "$(python deploy/behavioral_executor/bundle_identity.py)"
+gh variable set CODEMENTOR_VERIFIER_PYTHON_BASE_IMAGE \
+  --body 'python:3.11-slim@sha256:<reviewed 64-character digest>'
+```
 
-## Safe testing sequence
+Create `CODEMENTOR_BEHAVIORAL_ATTESTATION_HMAC_KEY` as a repository Actions
+secret using a password manager/secret manager, then install the same value in
+the API deployment as `GITHUB_BEHAVIORAL_ATTESTATION_HMAC_KEY`. Do not place
+the secret in shell arguments, candidate workflow environment, or logs.
 
-1. Run offline Python tests listed below. These mock container and GitHub API
-   operations and make no external writes.
-2. On a dedicated Linux executor host, provision Docker Engine and gVisor,
-   build/review/publish the runner image, set its immutable digest, and verify
-   `runsc` is available. Exercise a non-production HMAC key and disposable
-   test bundle; verify network isolation, limits, timeout, cleanup, and
-   signature verification. The local mock suite does not validate deployed
-   isolation.
-3. Configure the API to use the HTTPS broker and a private test bundle. Verify
-   `/api/verification/capabilities` reports the intended readiness without
-   enabling GitHub staging.
-4. After separate operator approval, enable only candidate staging for an
-   explicitly opted-in test repository/branch. Use a staging-only credential;
-   leave `GITHUB_AUTONOMOUS_COMMIT_ENABLED=false` and do not configure the final
-   write credential. Confirm exact-SHA candidate checks pass and the operation
-   ends in `AUTONOMOUS_COMMIT_DISABLED` with no final ref update.
-5. Final commits require a separate explicit decision after review of staged
-   behavior, independent calibration evidence, repository policy, token scope,
-   audit records, and exact-SHA checks. Do not enable them as part of this
-   readiness work.
+Configure repository secret:
 
-For a later, separately approved commit test, the operator must first install
-and verify the independent calibration artifact and the exact required CI
-checks, provide `GITHUB_AUTONOMOUS_COMMIT_TOKEN` with only the required
-repository `Contents: write` permission, and set
-`GITHUB_AUTONOMOUS_COMMIT_ENABLED=true` in the deployment secret manager. The
-administrator must separately opt the test repository and permitted branch in
-through its policy file. Keep candidate staging and final-commit tokens
-separate. This readiness change makes none of those configuration changes.
+- `CODEMENTOR_BEHAVIORAL_ATTESTATION_HMAC_KEY` — random secret of at least 32
+  bytes. Store the same value in the API deployment as
+  `GITHUB_BEHAVIORAL_ATTESTATION_HMAC_KEY`. Never put it in candidate workflow
+  jobs or logs.
 
-## Verification and remaining limits
+The API's read-only GitHub credential must have repository `Actions: read`,
+`Contents: read`, and access to workflow runs/artifacts. The separate staging
+credential (`GITHUB_CANDIDATE_STAGING_TOKEN`) needs `Contents: write` and
+`Actions: write` to create the temporary candidate ref and dispatch candidate
+CI. The separate final-write credential (`GITHUB_AUTONOMOUS_COMMIT_TOKEN`)
+needs `Contents: write` for the permitted PR branch ref update. The candidate
+workflow has only `contents: read`; the trusted `workflow_run` workflow has
+`contents: read` and `actions: read`. No Groq, GitHub write or API secrets are
+passed to candidate execution. Keep checkout credential persistence disabled.
 
-Offline regression coverage includes request authentication, stale/replayed
-requests, digest/path/limit validation, signed attestation compatibility,
-container security arguments, cleanup failure, tuple evidence, candidate
-staging with commits disabled, exact-SHA CI, missing/stale/failed checks, and a
-fully mocked low-risk flow. The focused suite passed **99 tests**; the complete
-offline backend/RAG/dataset suite passed **500 tests** with one third-party
-deprecation warning. Candidate code is never executed by the Mac test suite.
-The dedicated Linux `runsc` deployment and live staging remain unverified
-external steps. Behavioral regression testing is only available through that
-external service; GitHub Actions regression tests are separate and have not yet
-been run by an actual workflow dispatch.
+The three required check-run names in `required_github_checks` must match the
+candidate workflow job names: `candidate-syntax`, `candidate-static`, and
+`candidate-regression`. The behavioral attestation is verified separately
+against the signer workflow and pinned test-bundle identity.
+
+API settings for this provider:
+
+```text
+GITHUB_BEHAVIORAL_VERIFICATION_PROVIDER=github_actions
+GITHUB_BEHAVIORAL_ATTESTATION_HMAC_KEY=<same secret as the Actions signer>
+GITHUB_BEHAVIORAL_ATTESTATION_WORKFLOW_ID=<numeric attestation workflow ID>
+GITHUB_BEHAVIORAL_TEST_BUNDLE_SHA256=<pinned bundle identity>
+GITHUB_CANDIDATE_WORKFLOW_ID=<numeric candidate workflow ID>
+GITHUB_CANDIDATE_CI_WAIT_SECONDS=180
+```
+
+Do not configure the remote broker at the same time unless
+`GITHUB_BEHAVIORAL_VERIFICATION_PROVIDER` explicitly selects exactly one
+provider. An unknown, incomplete or conflicting provider configuration is
+unavailable and fails closed.
+
+## Authorization modes
+
+All switches are off by default. Repository-level autonomous-fix opt-in and
+the current category, confidence, path, branch and three-line policies remain
+required in every mode.
+
+| Mode | Configuration | Result |
+| --- | --- | --- |
+| Reviews only | `GITHUB_CANDIDATE_STAGING_ENABLED` unset/false; `GITHUB_AUTONOMOUS_COMMIT_ENABLED` unset/false | Reviews only; no candidate staging or final PR-branch write. |
+| Staging only | `GITHUB_CANDIDATE_STAGING_ENABLED=true`; autonomous commit switch false | Candidate staging, workflow verification and CI may run; no final PR-branch write. |
+| Hosted prototype final commit | Staging enabled, `GITHUB_AUTONOMOUS_COMMIT_ENABLED=true`, final-write credential configured, and `GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY=prototype` | Final adapter may update only the authorized PR branch after every gate passes. This accepts the GitHub-hosted Docker trust boundary. |
+
+The final write uses `GITHUB_AUTONOMOUS_COMMIT_TOKEN`, separate from
+`GITHUB_CANDIDATE_STAGING_TOKEN`. Do not enable the policy or switches during
+staging validation. The prototype policy is not equivalent to gVisor.
+
+## Candidate staging-only test
+
+The repository opt-in and current branch policy must already allow the test
+repository and branch. For the first live run, use staging-only mode: set only
+`GITHUB_CANDIDATE_STAGING_ENABLED=true` and configure a staging credential
+with the narrow scopes above. Keep `GITHUB_AUTONOMOUS_COMMIT_ENABLED=false`,
+leave `GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY` unset, and do not configure a
+final-write token.
+No live workflow was dispatched during implementation.
+
+Validate offline first:
+
+```sh
+python -m pytest -q tests/test_github_actions.py tests/test_github_pr.py \
+  tests/test_autonomous_commit.py tests/test_github_behavioral_attestation.py
+python -m pytest -q tests
+git --no-pager diff --check
+```
+
+After workflow installation and configuration, inspect the resolved API
+capability response, then separately authorize the first staging-only test.
+The action must create one candidate commit, dispatch the configured workflow
+on the default branch, observe its unique successful run created after the
+dispatch whose title binds the exact candidate SHA, and obtain exactly one fresh
+attestation from the configured default-branch signer workflow. The result
+must bind repository, candidate SHA, parent SHA, changed path, source digest,
+source workflow ID/run ID, signer workflow ID/run ID, and test bundle identity.
+The operation must end in `AUTONOMOUS_COMMIT_DISABLED`; verify there is no
+update to the PR branch. A missing or duplicate workflow run/artifact, expired
+artifact, stale SHA, wrong workflow ID, test failure, timeout, or infrastructure
+error must remain blocked.
+
+## Controlled prototype final-commit setup
+
+For an offline mocked final-write test, set the explicit policy to
+`prototype` on the test executor and mock the GitHub write. Do not enable live
+workflow dispatches or GitHub writes as part of this implementation. A later
+controlled live test requires an owner-approved repository opt-in, reviewed
+default-branch workflows and bundle identity, valid signed confidence
+calibration, required candidate checks, the staging credential, the separate
+final-write credential, `GITHUB_CANDIDATE_STAGING_ENABLED=true`,
+`GITHUB_AUTONOMOUS_COMMIT_ENABLED=true`, and
+`GITHUB_HOSTED_AUTONOMOUS_COMMIT_POLICY=prototype`. The executor checks the
+PR identity and head again before the narrow, non-force ref update. Missing,
+stale, ambiguous or mismatched evidence blocks the final write.
+
+## Security assumptions and limitations
+
+- Both workflow files must remain on the default branch and their numeric
+  workflow IDs must match the API configuration. Dispatch always selects the
+  default-branch workflow definition; it never selects the candidate branch's
+  workflow file. Protect changes to those files, the bundle identity, runner
+  image inputs and HMAC secret.
+- A fresh default-branch test bundle is checked against a repository variable
+  before tests run. The candidate checkout is only the exact source being
+  tested; its test files and workflow definitions do not supply the trusted
+  behavioral tests or signing code.
+- The attestation signature proves which trusted workflow produced the result
+  and what exact inputs/outcome it reported. It does not prove absence of
+  kernel vulnerabilities or independently prove GitHub's infrastructure.
+- Docker `--network=none`, read-only filesystems, dropped capabilities,
+  `no-new-privileges`, no host mounts, and resource limits restrict the process
+  inside the hosted VM. Docker still shares the runner VM kernel. The explicit
+  prototype policy accepts this weaker boundary; it does not claim gVisor
+  isolation or eliminate hosted-runner/kernel risk.
+- GitHub-hosted runners and GitHub artifact availability are external runtime
+  dependencies. A missing/ambiguous result is an error, never a pass. The
+  artifact retention is one day and the API accepts only a recent attestation.
+- No live GitHub writes, workflow dispatches, Groq requests, local model
+  inference, or model training are part of offline validation.
+
+## Existing gVisor deployment
+
+The existing `deploy/behavioral_executor/` HTTPS service remains supported as
+an optional mode. Its deployment must still be reviewed independently: a
+dedicated Linux host, verified `runsc`, digest-pinned image, owner-only test
+bundle, TLS, HMAC key, resource limits, and no GitHub/Groq/API credentials on
+the executor. See `deploy/behavioral_executor/README.md` for its separate
+deployment commands. Do not use Docker Desktop as a substitute for gVisor.
