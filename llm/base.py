@@ -26,3 +26,12 @@ class BaseLLM(ABC):
     ) -> str:
         """Optionally generate a structured fix candidate for one validated finding."""
         raise NotImplementedError("This LLM provider does not support fix generation.")
+
+    def describe_issue(self, code: str, context: List[str]) -> str:
+        """Describe a hard/complex issue in detail without providing a fix.
+
+        Default implementation falls back to analyze_code.
+        Providers may override this to give a more detailed explanation
+        tailored for hard issues that require manual intervention.
+        """
+        return self.analyze_code(code, context)

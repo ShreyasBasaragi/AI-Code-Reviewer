@@ -3,6 +3,11 @@
 No secure secret vault is configured by default. The optional API-key update is
 process-memory-only and disappears on restart; deployments should prefer a
 secret manager or environment injection. Public snapshots never contain keys.
+
+Provider roles:
+  - review_provider / fix_provider: local Qwen fine-tuned model (DEFAULT)
+    Override via AI_CODE_REVIEWER_PROVIDER / AI_CODE_REVIEWER_FIX_PROVIDER env vars.
+  - Groq API: used ONLY for Easy/Hard classification (always via GROQ_API_KEY env var).
 """
 
 from __future__ import annotations
@@ -30,8 +35,10 @@ class ProviderSettingsStore:
         self._generation = 0
         self._secret = os.getenv("GROQ_API_KEY")
         self._settings: dict[str, Any] = {
-            "review_provider": _provider_name(os.getenv("AI_CODE_REVIEWER_PROVIDER", "groq")),
-            "fix_provider": _provider_name(os.getenv("AI_CODE_REVIEWER_FIX_PROVIDER", "groq")),
+            # Default to local Qwen for both review and fix.
+            # Groq is used ONLY for Easy/Hard classification (not configurable here).
+            "review_provider": _provider_name(os.getenv("AI_CODE_REVIEWER_PROVIDER", "qwen_local")),
+            "fix_provider": _provider_name(os.getenv("AI_CODE_REVIEWER_FIX_PROVIDER", "qwen_local")),
             "groq_model": os.getenv("GROQ_MODEL", DEFAULT_MODEL),
             "qwen_base_model": os.getenv("QWEN_BASE_MODEL_ID", DEFAULT_BASE_MODEL_ID),
             "qwen_adapter_path": str(Path(os.getenv("QWEN_ADAPTER_PATH", str(DEFAULT_ADAPTER_DIR))).expanduser()),

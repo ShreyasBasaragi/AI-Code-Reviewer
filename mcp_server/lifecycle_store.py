@@ -66,7 +66,7 @@ class SQLiteLifecycleStore:
             parent = self.path.parent.lstat()
         except OSError as exc:
             raise RuntimeError("lifecycle_state_directory_unavailable") from exc
-        if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid():
+        if not stat.S_ISDIR(parent.st_mode) or (hasattr(os, 'getuid') and parent.st_uid != os.getuid()):
             raise RuntimeError("lifecycle_state_directory_owner_invalid")
         if parent.st_mode & 0o077:
             try:
@@ -80,9 +80,10 @@ class SQLiteLifecycleStore:
             fd = os.open(self.path, flags, 0o600)
             try:
                 info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                if not stat.S_ISREG(info.st_mode) or (hasattr(os, 'getuid') and info.st_uid != os.getuid()):
                     raise RuntimeError("lifecycle_state_file_owner_invalid")
-                os.fchmod(fd, 0o600)
+                if hasattr(os, 'fchmod'):
+                    os.fchmod(fd, 0o600)
             finally:
                 os.close(fd)
             db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)

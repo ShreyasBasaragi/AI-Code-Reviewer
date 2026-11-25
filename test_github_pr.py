@@ -82,9 +82,12 @@ def main():
             pass
 
     if not token:
-        print("ERROR: GITHUB_TOKEN environment variable is not set and no credentials found.")
-        print("Set it with:  set GITHUB_TOKEN=ghp_your_token_here")
-        sys.exit(1)
+        if args.dry_run:
+            logger.info("No GITHUB_TOKEN set. Proceeding with unauthenticated public API access for dry run.")
+        else:
+            print("ERROR: GITHUB_TOKEN environment variable is not set and no credentials found.")
+            print("Set it with:  set GITHUB_TOKEN=ghp_your_token_here")
+            sys.exit(1)
 
     from mcp_server.orchestrator import handle_pr_event, save_pipeline_results
 

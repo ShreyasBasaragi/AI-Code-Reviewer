@@ -82,7 +82,7 @@ def _restrict_state(path: Path) -> None:
         parent = path.parent.stat()
     except OSError as exc:
         raise AdminAuthError("authentication_state_directory_unavailable") from exc
-    if parent.st_uid != os.getuid() or not stat.S_ISDIR(parent.st_mode):
+    if (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and parent.st_uid != os.getuid()))))) or not stat.S_ISDIR(parent.st_mode):
         raise AdminAuthError("authentication_state_directory_owner_invalid")
     if parent.st_mode & 0o077:
         try:
@@ -95,9 +95,14 @@ def _restrict_state(path: Path) -> None:
     try:
         descriptor = os.open(path, flags, 0o600)
         info = os.fstat(descriptor)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        if not stat.S_ISREG(info.st_mode) or (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and info.st_uid != os.getuid()))))):
             raise AdminAuthError("authentication_state_file_owner_invalid")
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, 'fchmod'):
+            if hasattr(os, 'fchmod'):
+            if hasattr(os, 'fchmod'):
+            if hasattr(os, 'fchmod'):
+            if hasattr(os, 'fchmod'):
+            os.fchmod(descriptor, 0o600)
     except OSError as exc:
         raise AdminAuthError("authentication_state_file_unavailable") from exc
     finally:

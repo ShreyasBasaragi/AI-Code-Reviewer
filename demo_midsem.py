@@ -6,9 +6,11 @@ Demonstrates:
   1. Target Code Input (Vulnerabilities / Anti-patterns)
   2. RAG Knowledge Retrieval from ChromaDB
   3. Augmentation & Context Assembly
-  4. Fine-Tuned Qwen 2.5 Coder 3B LoRA Inference
-  5. Windows Desktop Toast Alert Notification
-  6. MCP Tool Invocation
+  4. Groq API — Easy/Hard Classification
+  5. Fine-Tuned Qwen 2.5 Coder 3B LoRA Inference
+     - If EASY: Qwen generates a code fix
+     - If HARD: Qwen describes the issue in detail
+  6. Windows Desktop Toast Alert Notification
 """
 
 import os
@@ -20,6 +22,7 @@ from rag.retrieve import retrieve_context
 from rag.augment import augment_context
 from llm.qwen_client import QwenLLM
 from mcp_server.notifier import notify_user_if_issue, send_windows_toast
+from mcp_server.orchestrator import classify_review_with_groq
 
 DEMO_CASES = [
     {
@@ -80,16 +83,68 @@ def run_demo_case(case: dict, llm: QwenLLM):
     augmented = augment_context(case["code"], retrieved)
     print("--> Context prompt assembled successfully.")
 
-    print("\n[STEP 4] Running Fine-Tuned Qwen 2.5 Coder 3B Model Inference...")
+    # -----------------------------------------------------------------
+    # STEP 4: Groq classifies the issue as Easy or Hard
+    # -----------------------------------------------------------------
+    print("\n[STEP 4] Groq API — Classifying issue (Easy / Hard)...")
+    t_cls = time.time()
+    classification, reason, source = classify_review_with_groq(case["code"], retrieved)
+    t_cls = time.time() - t_cls
+    badge = "✅ Easy" if classification == "Easy" else "⚠️  Hard"
+    print(f"--> Classification: {badge}  |  Source: {source}  ({t_cls:.2f}s)")
+    print(f"    Reason: {reason}")
+
+    # -----------------------------------------------------------------
+    # STEP 5: Local Qwen LLM — analyze code, then fix or describe
+    # -----------------------------------------------------------------
+    print("\n[STEP 5] Fine-Tuned Qwen 2.5 Coder 3B — Code Analysis...")
     t1 = time.time()
     review = llm.analyze_code(code=case["code"], context=retrieved)
     t_llm = time.time() - t1
     print(f"--> Inference complete in {t_llm:.2f}s.")
 
-    print("\n[STEP 5] Model Review Output:")
+    print("\n[STEP 5a] Qwen Review Output:")
     print("=" * 60)
     print(review)
     print("=" * 60)
+
+    if classification == "Easy":
+        print("\n[STEP 5b] ✨ EASY ISSUE — Qwen generating code fix...")
+        try:
+            from review_schema import ReviewFinding
+            from mcp_server.orchestrator import parse_review_response
+            parsed = parse_review_response(review, [])
+            if parsed.valid and parsed.findings:
+                finding = parsed.findings[0]
+                t_fix = time.time()
+                fix_output = llm.generate_fix(case["code"], finding, retrieved)
+                t_fix = time.time() - t_fix
+                print(f"--> Fix generated in {t_fix:.2f}s:")
+                print("-" * 60)
+                print(fix_output)
+                print("-" * 60)
+            else:
+                print("--> No actionable findings to fix (code may already be correct).")
+        except Exception as exc:
+            print(f"--> Fix generation failed: {exc}")
+
+    else:
+        print("\n[STEP 5b] 🔍 HARD ISSUE — Qwen describing issue in detail (no auto-fix)...")
+        try:
+            describe_fn = getattr(llm, "describe_issue", None)
+            if callable(describe_fn):
+                t_desc = time.time()
+                description = describe_fn(case["code"], retrieved)
+                t_desc = time.time() - t_desc
+                print(f"--> Description generated in {t_desc:.2f}s:")
+            else:
+                description = review
+            print("-" * 60)
+            print(description)
+            print("-" * 60)
+        except Exception as exc:
+            print(f"--> Issue description failed: {exc}")
+            print("    (Using review output above as the issue description.)")
 
     print("\n[STEP 6] MCP Desktop Notification Trigger:")
     notified = notify_user_if_issue(review, file_path=case["file_path"])
@@ -104,6 +159,13 @@ def main():
     print("       CRITIQUE — AUTONOMOUS AI CODE REVIEWER")
     print("           MIDSEM PRESENTATION DEMONSTRATION")
     print("=" * 75)
+    print()
+    print("Pipeline flow:")
+    print("  1. RAG context retrieval (ChromaDB)")
+    print("  2. Groq API  → Easy / Hard classification")
+    print("  3. Local Qwen LLM → Code analysis")
+    print("     Easy issue → Qwen generates a fix")
+    print("     Hard issue → Qwen describes the issue (no auto-fix)")
 
     # Initial test toast to verify desktop notifications on presenter's screen
     print("\n[INIT] Testing Windows Desktop Toast notification subsystem...")
@@ -114,12 +176,12 @@ def main():
     llm = QwenLLM()
 
     print("\nSelect an option:")
-    print("  1. Run SQL Injection Vulnerability Test")
-    print("  2. Run Mutable Default Parameter Test")
-    print("  3. Run Clean Code Baseline Test")
+    print("  1. Run SQL Injection Vulnerability Test     [expects: Hard]")
+    print("  2. Run Mutable Default Parameter Test       [expects: Hard or Easy]")
+    print("  3. Run Clean Code Baseline Test             [expects: Easy]")
     print("  4. Run All 3 Tests Sequentially (Full Demo)")
 
-    choice = input("\nEnter choice [1-4] (default=1): ").strip() or "1"
+    choice = input("\nEnter choice [1-4] (default=4): ").strip() or "4"
 
     if choice in ["1", "2", "3"]:
         idx = int(choice) - 1

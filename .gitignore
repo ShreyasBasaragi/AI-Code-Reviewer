@@ -43,6 +43,7 @@ huggingface/
 *.sqlite3
 models/
 llm/model/
+llm/model_old/
 llm/weights/
 *.safetensors
 *.bin

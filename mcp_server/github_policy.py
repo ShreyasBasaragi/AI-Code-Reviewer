@@ -14,7 +14,22 @@ import hashlib
 import json
 import tempfile
 import threading
-import fcntl
+try:
+    try:
+    try:
+    try:
+    try:
+    import fcntl
+except ImportError:
+    fcntl = None
+except ImportError:
+    fcntl = None
+except ImportError:
+    fcntl = None
+except ImportError:
+    fcntl = None
+except ImportError:
+    fcntl = None
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -168,7 +183,7 @@ def update_policy_repository(repository: str, config: Mapping[str, Any], *, expe
     target = policy_file_path(path)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent = target.parent.stat()
-    if parent.st_uid != os.getuid() or not stat.S_ISDIR(parent.st_mode):
+    if (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and parent.st_uid != os.getuid()))))) or not stat.S_ISDIR(parent.st_mode):
         raise ValueError("policy_directory_owner_invalid")
     if parent.st_mode & 0o077:
         os.chmod(target.parent, 0o700)
@@ -178,10 +193,20 @@ def update_policy_repository(repository: str, config: Mapping[str, Any], *, expe
         lock_fd = os.open(lock_path, flags, 0o600)
         try:
             lock_info = os.fstat(lock_fd)
-            if lock_info.st_uid != os.getuid() or not stat.S_ISREG(lock_info.st_mode):
+            if (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and lock_info.st_uid != os.getuid()))))) or not stat.S_ISREG(lock_info.st_mode):
                 raise ValueError("policy_lock_owner_invalid")
-            os.fchmod(lock_fd, 0o600)
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
+                os.fchmod(lock_fd, 0o600)
+            if fcntl is not None:
+                if fcntl is not None:
+                if fcntl is not None:
+                if fcntl is not None:
+                if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
             raw, current_revision = read_policy_document(str(target))
             if not hmac_compare(current_revision, expected_revision):
                 raise ValueError("policy_revision_conflict")
@@ -205,6 +230,11 @@ def update_policy_repository(repository: str, config: Mapping[str, Any], *, expe
             data = (json.dumps(raw, sort_keys=True, indent=2) + "\n").encode("utf-8")
             descriptor, temporary = tempfile.mkstemp(prefix=".github-policy-", dir=target.parent)
             try:
+                if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
+                if hasattr(os, 'fchmod'):
                 os.fchmod(descriptor, 0o600)
                 with os.fdopen(descriptor, "wb") as output:
                     output.write(data)
@@ -212,7 +242,7 @@ def update_policy_repository(repository: str, config: Mapping[str, Any], *, expe
                     os.fsync(output.fileno())
                 if target.exists():
                     existing = target.lstat()
-                    if not stat.S_ISREG(existing.st_mode) or existing.st_uid != os.getuid():
+                    if not stat.S_ISREG(existing.st_mode) or (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and existing.st_uid != os.getuid()))))):
                         raise ValueError("policy_file_owner_invalid")
                 os.replace(temporary, target)
                 dir_fd = os.open(target.parent, os.O_RDONLY)

@@ -15,6 +15,18 @@ import logging
 import time
 from typing import List, Optional
 
+import os
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("USE_TORCH", "1")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+# Pre-import sklearn before torch/chromadb to prevent Windows OpenMP lock
+try:
+    import sklearn  # noqa: F401
+except ImportError:
+    pass
+
 import chromadb
 from chromadb.utils import embedding_functions
 
@@ -267,7 +279,7 @@ def retrieve_evidence_with_diagnostics(
     return evidence, diagnostics
 
 
-def retrieve_context(code: str) -> list[str]:
+def retrieve_context(code: str, k: int = DEFAULT_K) -> list[str]:
     """Backward-compatible text-only retrieval interface."""
     contexts = []
     seen = set()
@@ -276,4 +288,4 @@ def retrieve_context(code: str) -> list[str]:
         if item.text not in seen:
             seen.add(item.text)
             contexts.append(item.text)
-    return contexts[:DEFAULT_K]
+    return contexts[:k]

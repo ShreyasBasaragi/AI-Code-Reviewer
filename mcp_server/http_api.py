@@ -406,7 +406,7 @@ def create_app(service: Optional[ReviewFixService] = None,
         target = Path(test_path).expanduser()
         try:
             info = target.lstat()
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            if (not stat.S_ISREG(info.st_mode) or (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and info.st_uid != os.getuid())))))
                     or info.st_mode & 0o077 or info.st_size > 2 * 1024 * 1024):
                 return None
             return target.read_bytes()

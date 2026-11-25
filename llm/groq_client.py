@@ -1,6 +1,6 @@
 import json
 import os
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from groq import Groq
 
@@ -23,6 +23,44 @@ STRICT_STRUCTURED_OUTPUT_MODELS = frozenset({DEFAULT_MODEL})
 
 class UnsupportedStructuredOutputModelError(RuntimeError):
     """Raised rather than silently sending an unconstrained review request."""
+
+
+# --- JSON Schema for Groq classification response ---
+def _groq_classification_response_format():
+    """Strict JSON Schema for Groq issue classification (Easy/Hard)."""
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "issue_classification",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "classification": {
+                        "type": "string",
+                        "enum": ["Easy", "Hard"],
+                        "description": (
+                            "Easy: style, formatting, naming, whitespace, docstring, "
+                            "type hint, unused import, PEP8, refactoring issues. "
+                            "Hard: security vulnerabilities, logic errors, crashes, "
+                            "data loss, race conditions, injection attacks, "
+                            "authentication/authorization bugs, memory leaks, "
+                            "or any issue that could cause runtime failures."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "Brief explanation of why the code issue is classified "
+                            "as Easy or Hard. Reference the specific issue type."
+                        ),
+                    },
+                },
+                "required": ["classification", "reason"],
+                "additionalProperties": False,
+            },
+        },
+    }
 
 
 class GroqLLM(BaseLLM):
@@ -135,6 +173,138 @@ applies to a finding, leave evidence_ids empty and mark it uncertain.
             raise RuntimeError("Groq returned an empty response.")
 
         return content.strip()
+
+    def classify_code_issue(self, code: str, context: List[str]) -> Tuple[str, str]:
+        """Use Groq to classify a code issue as Easy or Hard.
+
+        This sends the code and context to Groq with a classification-specific
+        prompt, requesting a structured JSON response with 'classification'
+        (Easy/Hard) and 'reason'.
+
+        Args:
+            code: Source code or PR diff to classify.
+            context: Retrieved RAG context snippets.
+
+        Returns:
+            Tuple of (classification, reason) where classification is
+            "Easy" or "Hard".
+        """
+        context_text = "\n\n".join(
+            f"--- Context #{i} ---\n{item}"
+            for i, item in enumerate(context, start=1)
+            if item and item.strip()
+        )
+        if not context_text:
+            context_text = "No relevant context available."
+
+        prompt = f"""Analyze the following code or pull-request diff and classify the issues found.
+
+Classify as "Easy" if the issues are ONLY about:
+- Style, formatting, naming conventions, whitespace, indentation
+- Missing or incomplete docstrings, comments
+- PEP8 / linting violations
+- Type hints, import ordering, unused imports/variables
+- Simple refactoring suggestions
+- Magic numbers, line length, trailing whitespace
+
+Classify as "Hard" if ANY issue involves:
+- Security vulnerabilities (SQL injection, XSS, CSRF, SSRF, path traversal, etc.)
+- Logic errors, bugs, crashes, data loss
+- Race conditions, deadlocks, memory/resource leaks
+- Authentication or authorization problems
+- Unsafe deserialization, remote code execution
+- Integer overflow, null pointer, divide by zero
+- Any issue that could cause runtime failures or data corruption
+
+If no issues are found, classify as "Easy".
+If in doubt, classify as "Hard" (err on the side of caution).
+
+================ CODE / PR DIFF ================
+{code}
+
+================ REFERENCE CONTEXT ================
+{context_text}
+
+Respond with the JSON classification."""
+
+        response = self._create_completion(
+            model=self.model,
+            temperature=self.temperature,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a code issue classifier. Your job is to determine "
+                        "whether code issues are Easy (style/formatting) or Hard "
+                        "(security/logic/bugs). Respond with strict JSON."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            response_format=_groq_classification_response_format(),
+            max_completion_tokens=256,
+        )
+
+        content = response.choices[0].message.content
+        if not content:
+            return "Hard", "Groq returned an empty classification response -- defaulting to Hard"
+
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            return "Hard", f"Could not parse Groq classification response -- defaulting to Hard"
+
+        classification = payload.get("classification", "Hard")
+        reason = payload.get("reason", "No reason provided by Groq")
+
+        if classification not in ("Easy", "Hard"):
+            classification = "Hard"
+            reason = f"Invalid classification '{payload.get('classification')}' -- defaulting to Hard"
+
+        return classification, reason
+
+    def classify_hunk_plaintext(self, hunk_text: str) -> str:
+        """Classify a code hunk as 'easy' or 'hard' using plain-text output only.
+
+        This is the method used by the new routing pipeline (mcp_server/routing.py).
+        No JSON schema, no structured output.  Returns exactly "easy" or "hard".
+
+        Rules:
+          - Response must be exactly the word "easy" (after strip+lower) to be treated
+            as easy.  Any other response (including "Easy.", garbage, empty) → "hard".
+          - temperature=0, max_tokens=5 (plain text, one word expected).
+          - API key is read from the GROQ_API_KEY environment variable.  Never
+            hardcode a key.
+        """
+        prompt = (
+            "You are a code-review classifier.\n\n"
+            "Reply with exactly one word: easy or hard.\n\n"
+            "easy = style, formatting, naming, whitespace, docstring, type hint, "
+            "unused import, PEP 8, trivial refactoring.\n"
+            "hard = security vulnerability, logic error, crash, data loss, "
+            "race condition, injection, auth/authz bug, memory leak, runtime failure.\n\n"
+            f"Code hunk to classify:\n{hunk_text}"
+        )
+        try:
+            response = self._create_completion(
+                model=self.model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Reply with exactly one word: easy or hard.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_completion_tokens=5,
+            )
+            raw = response.choices[0].message.content or ""
+            label = raw.strip().lower()
+            if label == "easy":
+                return "easy"
+            return "hard"
+        except Exception:  # noqa: BLE001
+            return "hard"
 
     def assess_static_finding_confidence(self, code: str, finding: dict) -> Optional[dict]:
         """Ask Groq to independently verify a deterministic low-risk finding.

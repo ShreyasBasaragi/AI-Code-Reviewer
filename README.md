@@ -28,38 +28,30 @@
 
 ## Architecture Overview
 
-```
-                      GitHub Pull Request Opened / Updated
-                                       │
-                                       ▼
-                       MCP / GitHub Webhook Listener
-                        (Fetches PR Diffs & Metadata)
-                                       │
-                                       ▼
-                   ┌───────────────────────────────────────┐
-                   │       RAG Retrieval (ChromaDB)        │
-                   │  Pulls Style Rules, Security Policies  │
-                   │    & Historical Anti-Pattern Context   │
-                   └───────────────────┬───────────────────┘
-                                       │
-                                       ▼
-                   ┌───────────────────────────────────────┐
-                   │    Fine-Tuned LLM (Qwen 2.5 Coder 3B) │
-                   │       LoRA Adapter + 4-bit NF4 Quant  │
-                   │        Inference on RTX 3050 GPU      │
-                   └───────────────────┬───────────────────┘
-                                       │
-                                       ▼
-                   ┌───────────────────────────────────────┐
-                   │     Automated Heuristic Classifier     │
-                   │   [Hard]: Security / Bugs / Leaks     │
-                   │   [Easy]: Style / Naming / Docstrings │
-                   └───────────────────┬───────────────────┘
-                                       │
-                        ┌──────────────┴──────────────┐
-                        ▼                             ▼
-           GitHub PR Review Comment        Windows Desktop Alert
-          (Posted via GitHub REST API)    (Native Toast Notification)
+```mermaid
+flowchart TD
+    A["GitHub Pull Request Opened / Updated"] --> B["MCP / Webhook / CLI Ingestion"]
+    B --> C["Diff Parser (Extracts Hunks & Affected Lines)"]
+    
+    subgraph S1 ["1. Context & Local AI Reasoning"]
+        C --> D["ChromaDB Vector DB (RAG)"]
+        D -->|Style rules, security guidelines, past reviews| E["Local Fine-Tuned Qwen 2.5 Coder 3B + LoRA (RTX 3050 GPU)"]
+        C -->|Code Hunk| E
+        E -->|Plain Text: Review Comment + Proposed Code Block| F["Output Parser (Extracts comment & code)"]
+    end
+
+    subgraph S2 ["2. Rapid Triage & Classification"]
+        F --> G["Groq API (Llama 3, temp=0, max_tokens=5)"]
+        G -->|Classifies finding| H{"Is finding 'easy'?"}
+    end
+
+    subgraph S3 ["3. Routing & Execution"]
+        H -->|HARD: Security, Logic Bugs, Complex Flaws| I["POST GitHub PR Review Comment<br/>(Explanation + suggestion block)"]
+        H -->|EASY: Style, Lint, Type Hints, Formatting| J["Run 6 Autocommit Gates (G1 to G6)"]
+        
+        J -->|Any Gate Fails| K["Downgrade to HARD Path<br/>(Post suggestion comment + log reason)"]
+        J -->|All Gates Pass| L["Autocommit to PR Branch via Candidate Staging"]
+    end
 ```
 
 ---
@@ -274,6 +266,58 @@ Configure your IDE MCP settings:
   }
 }
 ```
+
+### 6. Run Autocommit Routing & HMAC Attestation Test Suite
+```powershell
+pytest tests/test_routing.py tests/test_hmac_attest.py -v
+```
+
+---
+
+## Easy/Hard PR Routing & Autocommit Gates
+
+The routing pipeline classifies every reviewed hunk and routes it through one of two paths:
+
+### Routing Overview
+
+| Label | Path |
+|-------|------|
+| **HARD** | Post a PR review comment containing the model's explanation **and** a ```` ```suggestion ```` block.  A human decides whether to apply the fix.  Nothing is committed. |
+| **EASY** | Run all 6 autocommit gates in order.  If every gate passes the patch is auto-committed to the PR branch through a staging candidate branch.  If **any** gate fails the finding is **downgraded** to the HARD path (suggestion comment) and the reason is logged. |
+
+> **Model-generated fixes are only committed when the linter and the test suite both accept them.**
+
+### Classification
+
+The Groq API classifies each hunk using a plain-text prompt (`temperature=0`, `max_tokens=5`).  The response must be **exactly** the word `easy` (after strip + lower-case) to be treated as easy.  Any other response — including `"Easy."`, garbage text, or an empty string — is treated as `hard`.  API failures also default to `hard`.
+
+### Autocommit Gates (all must pass, in order)
+
+| Gate | Name | Rule |
+|------|------|------|
+| **G1** | Blast radius | The proposed change touches **at most 3 changed lines** in the hunk and only the single file in the hunk. |
+| **G2** | Protected paths | Reject any path under `.github/`, `auth/`, `infra/`, or any `migrations/` directory. |
+| **G3** | Linter agreement | Run the appropriate linter on the original file and the patched file.  The patch must **remove at least one lint diagnostic** that was present before and must **not add any new lint diagnostic**.  Language dispatch: `.py` → `ruff`; `.js/.jsx/.ts/.tsx` → `eslint` (via `npx`); `.go` → `go vet`; all other extensions → conservative reject (downgraded to suggestion).  There is no confidence score; the linter is the sole arbiter. |
+| **G4** | Staging | Create a branch `candidate-<pr-number>-<short-hash>`, commit the patch there, and push.  **Never commit to the developer's PR branch** at this stage. |
+| **G5** | CI | Trigger the `GITHUB_CANDIDATE_WORKFLOW_NAME` workflow on the candidate branch.  Require syntax check (`ast.parse`), lint, and the existing test suite to pass.  A timeout counts as failure. |
+| **G6** | Atomic push | Confirm the PR branch HEAD SHA still matches the SHA the review started from.  Then fast-forward the PR branch to the candidate commit using a **non-force push**.  If the SHA changed, abort. |
+
+The candidate branch is **always deleted** in a `finally` block after success or failure.
+
+### Required Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `GROQ_API_KEY` | Groq API key (classification only — never hardcoded) |
+| `GITHUB_TOKEN` | GitHub PAT with `repo` write scope (commits, branch ops, review comments) |
+| `GITHUB_CANDIDATE_WORKFLOW_NAME` | Filename of the GitHub Actions workflow to trigger for candidate CI (e.g. `candidate-verification.yml`) |
+| `CRITIQUE_HMAC_SECRET` | 32+ char secret for HMAC-SHA256 patch attestation — embedded in G4 commit message, verified before G6 fast-forward |
+| `CRITIQUE_HMAC_REQUIRED` | Set `1` to block G6 if HMAC is missing/mismatched; default `0` = soft warning only |
+
+### What Was Not Implemented
+
+- **Non-Python file linting for all ecosystems** — G3 now supports Python (`ruff`), JavaScript/TypeScript (`eslint` via `npx`), and Go (`go vet`).  Other languages (Java, Rust, C/C++, C#, Swift, Ruby) are conservatively rejected (downgraded to suggestion) until a linter is wired in.
+- **Multi-file hunk commits** — G1 intentionally rejects patches spanning more than one file; a git hunk is by definition per-file and auto-committing across files would exceed the blast-radius safety contract.
 
 ---
 

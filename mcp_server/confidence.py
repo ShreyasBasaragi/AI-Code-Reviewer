@@ -340,7 +340,7 @@ def persist_calibration_report(report: CalibrationReport, path: Path | str) -> P
     target = Path(path).expanduser()
     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent = target.parent.lstat()
-    if parent.st_uid != os.getuid() or not stat.S_ISDIR(parent.st_mode):
+    if (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and parent.st_uid != os.getuid()))))) or not stat.S_ISDIR(parent.st_mode):
         raise ValueError("calibration_directory_owner_invalid")
     if parent.st_mode & 0o077:
         raise ValueError("calibration_directory_permissions_invalid")
@@ -349,7 +349,8 @@ def persist_calibration_report(report: CalibrationReport, path: Path | str) -> P
     artifact = {**body, "signature": hmac.new(key, canonical, hashlib.sha256).hexdigest()}
     descriptor, temporary = tempfile.mkstemp(prefix=".confidence-calibration-", dir=target.parent)
     try:
-        os.fchmod(descriptor, 0o600)
+        if hasattr(os, 'fchmod'):
+            os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             json.dump(artifact, stream, sort_keys=True, separators=(",", ":"))
             stream.flush()
@@ -369,7 +370,7 @@ def load_calibration_report(path: Path | str) -> Optional[CalibrationReport]:
         return None
     try:
         info = target.lstat()
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and info.st_uid != os.getuid())))))
                 or info.st_mode & 0o077 or info.st_size > 256 * 1024):
             return None
         artifact = json.loads(target.read_text(encoding="utf-8"))
@@ -438,7 +439,7 @@ def load_runtime_confidence(path: Path | str, *, model_id: str, dataset_id: str,
     target = Path(path).expanduser()
     try:
         info = target.lstat()
-        if (len(key) < 32 or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (len(key) < 32 or not stat.S_ISREG(info.st_mode) or (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and (hasattr(os, 'getuid') and info.st_uid != os.getuid())))))
                 or info.st_mode & 0o077 or info.st_size > 64 * 1024):
             return None
         raw_bytes = target.read_bytes()
